@@ -146,3 +146,42 @@ pub fn match_command() -> CreateApplicationCommand {
     
     command
 }
+
+/// Create command for setting the server timezone
+pub fn timezone_command() -> CreateApplicationCommand {
+    let mut command = CreateApplicationCommand::default();
+    command
+        .name("timezone")
+        .description("Manage server timezone settings")
+        .dm_permission(false)
+        // Set subcommand
+        .create_option(|option| {
+            option
+                .name("set")
+                .description("Set the default timezone for this server")
+                .kind(CommandOptionType::SubCommand)
+                .create_sub_option(|sub_option| {
+                    sub_option
+                        .name("timezone")
+                        .description("Timezone name (e.g., 'America/New_York', 'Europe/London', 'Asia/Tokyo')")
+                        .kind(CommandOptionType::String)
+                        .required(true)
+                })
+        })
+        // Show subcommand
+        .create_option(|option| {
+            option
+                .name("show")
+                .description("Show the current server timezone")
+                .kind(CommandOptionType::SubCommand)
+        })
+        // List subcommand
+        .create_option(|option| {
+            option
+                .name("list")
+                .description("List available timezone options")
+                .kind(CommandOptionType::SubCommand)
+        });
+    
+    command
+}

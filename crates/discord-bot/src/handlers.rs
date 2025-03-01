@@ -49,14 +49,54 @@ impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
         info!("{} is connected!", ready.user.name);
 
-        // Register commands globally (visible in all servers)
-        if let Err(why) = serenity::model::application::command::Command::set_global_application_commands(&ctx.http, |commands| {
+        // For dev testing, register for specific guilds to avoid global command cache delay
+        // If running in dev environment, register commands for development servers
+        if let Some(test_guild_id) = self.config.test_guild_id {
+            let guild_id = serenity::model::id::GuildId(test_guild_id);
+            
+            match guild_id.set_application_commands(&ctx.http, |commands| {
+                // Register all commands
+                crate::commands::register_commands(commands)
+            }).await {
+                Ok(cmds) => {
+                    info!("Guild commands registered successfully for {}! Total commands: {}", test_guild_id, cmds.len());
+                    for cmd in cmds {
+                        info!("Command registered: /{} - {}", cmd.name, cmd.description);
+                    }
+                }
+                Err(why) => {
+                    error!("Error registering guild commands: {:?}", why);
+                }
+            }
+        }
+        
+        // Also register commands globally (visible in all servers, but with cache delay)
+        match serenity::model::application::command::Command::set_global_application_commands(&ctx.http, |commands| {
             // Register all commands
             crate::commands::register_commands(commands)
         }).await {
-            error!("Error registering global commands: {:?}", why);
-        } else {
-            info!("Global commands registered successfully!");
+            Ok(cmds) => {
+                info!("Global commands registered successfully! Total commands: {}", cmds.len());
+                for cmd in cmds {
+                    info!("Command registered: /{} - {}", cmd.name, cmd.description);
+                }
+            }
+            Err(why) => {
+                error!("Error registering global commands: {:?}", why);
+            }
+        }
+        
+        // List existing commands for debugging
+        match serenity::model::application::command::Command::get_global_application_commands(&ctx.http).await {
+            Ok(cmds) => {
+                info!("Current global commands: {}", cmds.len());
+                for cmd in cmds {
+                    info!("Existing command: /{} - {}", cmd.name, cmd.description);
+                }
+            }
+            Err(why) => {
+                error!("Error listing global commands: {:?}", why);
+            }
         }
     }
 
@@ -78,6 +118,7 @@ impl EventHandler for Handler {
                     "schedule" => schedule::handle_schedule_command(handler_ctx, &command).await,
                     "group" => schedule::handle_group_command(handler_ctx, &command).await,
                     "match" => schedule::handle_match_command(handler_ctx, &command).await,
+                    "timezone" => schedule::handle_timezone_command(handler_ctx, &command).await,
                     _ => {
                         error!("Unknown command: {}", command.data.name);
                         Err(eyre::eyre!("Unknown command"))
@@ -141,6 +182,8 @@ pub struct ActivePoll {
     pub min_per_group: i64,
     pub required_yes_count: usize,
     pub responses: HashMap<String, bool>, // user_id -> yes/no
+    pub db_pool: sqlx::PgPool,
+    pub timezone: String,
 }
 
 /// Shared context for command handlers.

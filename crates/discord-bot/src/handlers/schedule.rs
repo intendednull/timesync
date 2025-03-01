@@ -1,4 +1,4 @@
-use chrono::Utc;
+use chrono::{Utc, Offset};
 use eyre::Result;
 use serenity::{
     model::{
@@ -13,6 +13,8 @@ use serenity::{
 };
 use timesync_core::models::discord::CreateDiscordGroupRequest;
 use std::collections::HashMap;
+use std::str::FromStr;
+use sqlx::Row;
 
 use crate::handlers::HandlerContext;
 
@@ -614,6 +616,44 @@ pub async fn handle_match_command(
     // Using a simple majority (over 50%)
     let required_yes_count = (total_unique_users as f64 * 0.5).ceil() as usize;
     
+    // Get the server's timezone or use UTC as default
+    let timezone = async {
+        // Check if the discord_servers table exists
+        let table_exists = sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 
+                FROM information_schema.tables 
+                WHERE table_name = 'discord_servers'
+            );
+            "#,
+        )
+        .fetch_one(&ctx.db_pool)
+        .await
+        .unwrap_or(false);
+        
+        if table_exists {
+            // Get the server's timezone
+            let result = sqlx::query(
+                "SELECT timezone FROM discord_servers WHERE server_id = $1"
+            )
+            .bind(server_id.clone())
+            .fetch_optional(&ctx.db_pool)
+            .await;
+            
+            match result {
+                Ok(Some(row)) => match row.try_get::<String, _>("timezone") {
+                    Ok(tz) => Some(tz),
+                    Err(_) => None
+                },
+                _ => None
+            }
+            .unwrap_or_else(|| "UTC".to_string())
+        } else {
+            "UTC".to_string()
+        }
+    }.await;
+    
     // Create initial poll with first match
     let active_poll = super::ActivePoll {
         matches: match_response.matches.clone(),
@@ -622,6 +662,8 @@ pub async fn handle_match_command(
         min_per_group,
         required_yes_count,
         responses: HashMap::new(),
+        db_pool: ctx.db_pool.clone(),
+        timezone,
     };
     
     // Create a formatted response with just the first match
@@ -720,9 +762,24 @@ async fn handle_match_vote(
         // Enough people agreed to this time, confirm it
         let match_result = &poll.matches[poll.current_index];
         
-        // Format confirmed time
-        let start_time = match_result.start.format("%a, %b %d at %H:%M");
-        let end_time = match_result.end.format("%H:%M");
+        // Format the time using the poll's timezone if possible
+        let (start_time, end_time, tz_display) = if let Ok(tz) = chrono_tz::Tz::from_str(&poll.timezone) {
+            let start_in_tz = match_result.start.with_timezone(&tz);
+            let end_in_tz = match_result.end.with_timezone(&tz);
+            
+            (
+                start_in_tz.format("%a, %b %d at %H:%M").to_string(),
+                end_in_tz.format("%H:%M").to_string(),
+                poll.timezone.clone()
+            )
+        } else {
+            // Fallback to UTC
+            (
+                match_result.start.format("%a, %b %d at %H:%M").to_string(),
+                match_result.end.format("%H:%M").to_string(),
+                "UTC".to_string()
+            )
+        };
         
         // Collect attendees for the ping message
         let attendees: Vec<String> = poll.responses.iter()
@@ -738,8 +795,8 @@ async fn handle_match_vote(
         };
         
         let mut description = format!(
-            "The meeting time has been confirmed!\n\n**{}** - **{}** UTC\n\n",
-            start_time, end_time
+            "The meeting time has been confirmed!\n\n**{}** - **{}** ({})\n\n",
+            start_time, end_time, tz_display
         );
         
         description.push_str("**Attending:**\n");
@@ -912,13 +969,28 @@ async fn handle_match_confirm(
 fn format_match_option(poll: &super::ActivePoll, index: usize, required_yes: usize) -> String {
     let match_result = &poll.matches[index];
     
-    // Format the time
-    let start_time = match_result.start.format("%a, %b %d at %H:%M");
-    let end_time = match_result.end.format("%H:%M");
+    // Format the time using the poll's timezone if possible
+    let (formatted_start, formatted_end, tz_display) = if let Ok(tz) = chrono_tz::Tz::from_str(&poll.timezone) {
+        let start_in_tz = match_result.start.with_timezone(&tz);
+        let end_in_tz = match_result.end.with_timezone(&tz);
+        
+        (
+            start_in_tz.format("%a, %b %d at %H:%M").to_string(),
+            end_in_tz.format("%H:%M").to_string(),
+            poll.timezone.clone()
+        )
+    } else {
+        // Fallback to UTC
+        (
+            match_result.start.format("%a, %b %d at %H:%M").to_string(),
+            match_result.end.format("%H:%M").to_string(),
+            "UTC".to_string()
+        )
+    };
     
     let mut description = format!(
-        "**Proposed Time:** {} - {} UTC\n\n",
-        start_time, end_time
+        "**Proposed Time:** {} - {} ({})\n\n",
+        formatted_start, formatted_end, tz_display
     );
     
     // Add group information
@@ -977,6 +1049,278 @@ fn format_match_option(poll: &super::ActivePoll, index: usize, required_yes: usi
     ));
     
     description
+}
+
+/// Handle the /timezone command
+pub async fn handle_timezone_command(
+    ctx: HandlerContext, 
+    command: &ApplicationCommandInteraction
+) -> Result<()> {
+    // Get the subcommand
+    let subcommand = command.data.options.first()
+        .ok_or_else(|| eyre::eyre!("Missing subcommand"))?;
+    
+    match subcommand.name.as_str() {
+        "set" => handle_timezone_set(ctx, command, subcommand).await,
+        "show" => handle_timezone_show(ctx, command).await,
+        "list" => handle_timezone_list(ctx, command).await,
+        _ => {
+            command.create_interaction_response(&ctx.ctx.http, |r| {
+                r.kind(InteractionResponseType::ChannelMessageWithSource)
+                    .interaction_response_data(|m| {
+                        m.content("Unknown subcommand").ephemeral(true)
+                    })
+            }).await?;
+            
+            Ok(())
+        }
+    }
+}
+
+/// Handle the /timezone set subcommand
+async fn handle_timezone_set(
+    ctx: HandlerContext,
+    command: &ApplicationCommandInteraction,
+    subcommand: &CommandDataOption,
+) -> Result<()> {
+    // Get the guild (server) ID
+    let server_id = command.guild_id
+        .ok_or_else(|| eyre::eyre!("Command must be used in a server"))?
+        .to_string();
+    
+    // Get the timezone option
+    let timezone = get_option_string(subcommand, "timezone")?;
+    
+    // Validate the timezone
+    if !is_valid_timezone(&timezone) {
+        command.create_interaction_response(&ctx.ctx.http, |r| {
+            r.kind(InteractionResponseType::ChannelMessageWithSource)
+                .interaction_response_data(|m| {
+                    m.content(format!(
+                        "Invalid timezone: {}. Use `/timezone list` to see available options.",
+                        timezone
+                    )).ephemeral(true)
+                })
+        }).await?;
+        
+        return Ok(());
+    }
+    
+    // First check if the discord_servers table exists
+    let table_exists = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT EXISTS (
+            SELECT 1 
+            FROM information_schema.tables 
+            WHERE table_name = 'discord_servers'
+        );
+        "#,
+    )
+    .fetch_one(&ctx.db_pool)
+    .await?;
+    
+    if !table_exists {
+        // Create the table if it doesn't exist
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS discord_servers (
+                server_id VARCHAR(255) PRIMARY KEY,
+                timezone VARCHAR(100) NOT NULL DEFAULT 'UTC',
+                created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+            );
+            "#,
+        )
+        .execute(&ctx.db_pool)
+        .await?;
+        
+        // Create index
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_discord_servers_server_id ON discord_servers(server_id)"
+        )
+        .execute(&ctx.db_pool)
+        .await?;
+    }
+    
+    // Store the timezone for the response
+    let timezone_copy = timezone.clone();
+    
+    // Insert or update the server's timezone
+    sqlx::query(
+        r#"
+        INSERT INTO discord_servers (server_id, timezone) 
+        VALUES ($1, $2)
+        ON CONFLICT (server_id) 
+        DO UPDATE SET timezone = $2
+        "#
+    )
+    .bind(server_id)
+    .bind(timezone)
+    .execute(&ctx.db_pool)
+    .await?;
+    
+    // Respond to the interaction
+    command.create_interaction_response(&ctx.ctx.http, |r| {
+        r.kind(InteractionResponseType::ChannelMessageWithSource)
+            .interaction_response_data(|m| {
+                m.embed(|e| {
+                    e.title("Server Timezone Updated")
+                        .description(format!("The server timezone has been set to **{}**", timezone_copy))
+                        .color(Color::DARK_GREEN)
+                        .footer(|f| f.text("All times in match commands will be displayed in this timezone"))
+                })
+            })
+    }).await?;
+    
+    Ok(())
+}
+
+/// Handle the /timezone show subcommand
+async fn handle_timezone_show(
+    ctx: HandlerContext,
+    command: &ApplicationCommandInteraction,
+) -> Result<()> {
+    // Get the guild (server) ID
+    let server_id = command.guild_id
+        .ok_or_else(|| eyre::eyre!("Command must be used in a server"))?
+        .to_string();
+    
+    // First check if the discord_servers table exists
+    let table_exists = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT EXISTS (
+            SELECT 1 
+            FROM information_schema.tables 
+            WHERE table_name = 'discord_servers'
+        );
+        "#,
+    )
+    .fetch_one(&ctx.db_pool)
+    .await?;
+    
+    let timezone_result = if table_exists {
+        // Get the server's timezone
+        let result = sqlx::query(
+            "SELECT timezone FROM discord_servers WHERE server_id = $1"
+        )
+        .bind(server_id)
+        .fetch_optional(&ctx.db_pool)
+        .await?;
+        
+        match result {
+            Some(row) => match row.try_get::<String, _>("timezone") {
+                Ok(tz) => Some(tz),
+                Err(_) => None
+            },
+            None => None
+        }
+    } else {
+        None
+    };
+    
+    let timezone = timezone_result.unwrap_or_else(|| "UTC".to_string());
+    
+    // Get the current time in that timezone
+    let utc_now = chrono::Utc::now();
+    let timezone_info = if let Ok(tz) = chrono_tz::Tz::from_str(&timezone) {
+        let local_time = utc_now.with_timezone(&tz);
+        
+        // Calculate offset in hours
+        let utc_offset = local_time.offset().fix().local_minus_utc() as f64 / 3600.0;
+        let offset_str = if utc_offset >= 0.0 {
+            format!("+{}", utc_offset)
+        } else {
+            format!("{}", utc_offset)
+        };
+        
+        format!(
+            "Current time: **{}**\nOffset from UTC: **{}**",
+            local_time.format("%Y-%m-%d %H:%M:%S"),
+            offset_str
+        )
+    } else {
+        "Unable to determine current time in this timezone.".to_string()
+    };
+    
+    // Respond to the interaction
+    command.create_interaction_response(&ctx.ctx.http, |r| {
+        r.kind(InteractionResponseType::ChannelMessageWithSource)
+            .interaction_response_data(|m| {
+                m.embed(|e| {
+                    e.title("Server Timezone")
+                        .description(format!("This server's timezone is set to **{}**", timezone))
+                        .field("Timezone Information", timezone_info, false)
+                        .color(Color::BLUE)
+                })
+            })
+    }).await?;
+    
+    Ok(())
+}
+
+/// Handle the /timezone list subcommand
+async fn handle_timezone_list(
+    ctx: HandlerContext,
+    command: &ApplicationCommandInteraction,
+) -> Result<()> {
+    // Common timezones by region
+    let timezones = vec![
+        ("**North America**", vec![
+            "America/Los_Angeles (Pacific Time)",
+            "America/Denver (Mountain Time)",
+            "America/Chicago (Central Time)",
+            "America/New_York (Eastern Time)",
+        ]),
+        ("**Europe**", vec![
+            "Europe/London (GMT/BST)",
+            "Europe/Paris (Central European Time)",
+            "Europe/Helsinki (Eastern European Time)",
+        ]),
+        ("**Asia/Pacific**", vec![
+            "Asia/Tokyo (Japan Standard Time)",
+            "Asia/Shanghai (China Standard Time)",
+            "Asia/Kolkata (India Standard Time)",
+            "Australia/Sydney (Australian Eastern Standard Time)",
+        ]),
+        ("**Other**", vec![
+            "UTC (Coordinated Universal Time)",
+            "Etc/GMT+12 (UTC-12)",
+            "Etc/GMT-12 (UTC+12)",
+        ]),
+    ];
+    
+    // Build description with all timezones
+    let mut description = "Here are some common timezones you can use:\n\n".to_string();
+    
+    for (region, zones) in timezones {
+        description.push_str(&format!("{}\n", region));
+        for zone in zones {
+            description.push_str(&format!("• `{}`\n", zone));
+        }
+        description.push_str("\n");
+    }
+    
+    description.push_str("\nUse `/timezone set <timezone>` to set your server's timezone. For a complete list of available timezones, see the [IANA Time Zone Database](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones).");
+    
+    // Respond to the interaction
+    command.create_interaction_response(&ctx.ctx.http, |r| {
+        r.kind(InteractionResponseType::ChannelMessageWithSource)
+            .interaction_response_data(|m| {
+                m.embed(|e| {
+                    e.title("Available Timezones")
+                        .description(description)
+                        .color(Color::BLUE)
+                        .footer(|f| f.text("Timezone data from the IANA Time Zone Database"))
+                })
+            })
+    }).await?;
+    
+    Ok(())
+}
+
+/// Check if a timezone string is valid
+fn is_valid_timezone(timezone: &str) -> bool {
+    // We'll validate by trying to parse it
+    chrono_tz::Tz::from_str(timezone).is_ok()
 }
 
 /// Extract a string option from a command

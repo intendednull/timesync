@@ -119,6 +119,19 @@ pub async fn initialize_database(pool: &Pool<Postgres>) -> Result<()> {
     )
     .execute(pool)
     .await?;
+    
+    // Create discord_servers table for server settings
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS discord_servers (
+            server_id VARCHAR(255) PRIMARY KEY,
+            timezone VARCHAR(100) NOT NULL DEFAULT 'UTC',
+            created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
 
     // Create group_members table
     sqlx::query(
@@ -172,6 +185,12 @@ pub async fn initialize_database(pool: &Pool<Postgres>) -> Result<()> {
     
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_discord_groups_server_id ON discord_groups(server_id)"
+    )
+    .execute(pool)
+    .await?;
+    
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_discord_servers_server_id ON discord_servers(server_id)"
     )
     .execute(pool)
     .await?;

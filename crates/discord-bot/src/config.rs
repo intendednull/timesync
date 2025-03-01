@@ -19,6 +19,8 @@ pub struct BotConfig {
     pub database_url: String,
     /// Prefix for commands (defaults to "!")
     pub command_prefix: Option<String>,
+    /// Test guild ID for faster command registration during development
+    pub test_guild_id: Option<u64>,
 }
 
 impl BotConfig {
@@ -40,12 +42,18 @@ impl BotConfig {
             
         let command_prefix = env::var("DISCORD_COMMAND_PREFIX").ok();
         
+        // Optional test guild ID for development
+        let test_guild_id = env::var("DISCORD_TEST_GUILD_ID")
+            .ok()
+            .and_then(|id| id.parse::<u64>().ok());
+        
         Ok(Self {
             token,
             application_id,
             web_base_url,
             database_url,
             command_prefix,
+            test_guild_id,
         })
     }
     

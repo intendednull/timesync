@@ -48,5 +48,11 @@ pub fn register_commands(commands: &mut CreateApplicationCommands) -> &mut Creat
         command
     });
     
+    // Create the timezone command
+    commands.create_application_command(|command| {
+        *command = schedule::timezone_command();
+        command
+    });
+    
     commands
 }
