@@ -724,6 +724,19 @@ async fn handle_match_vote(
         let start_time = match_result.start.format("%a, %b %d at %H:%M");
         let end_time = match_result.end.format("%H:%M");
         
+        // Collect attendees for the ping message
+        let attendees: Vec<String> = poll.responses.iter()
+            .filter(|&(_, is_attending)| *is_attending)
+            .map(|(user_id, _)| format!("<@{}>", user_id))
+            .collect();
+            
+        // Create ping message for attendees
+        let ping_message = if !attendees.is_empty() {
+            format!("🔔 Meeting attendees: {} - Please mark your calendars!", attendees.join(" "))
+        } else {
+            "No confirmed attendees yet.".to_string()
+        };
+        
         let mut description = format!(
             "The meeting time has been confirmed!\n\n**{}** - **{}** UTC\n\n",
             start_time, end_time
@@ -745,7 +758,8 @@ async fn handle_match_vote(
         
         // Update the message to show the confirmation
         component.message.edit(&ctx.ctx.http, |m| {
-            m.embed(|e| {
+            m.content(&ping_message)
+             .embed(|e| {
                 e.title("Meeting Time Confirmed!")
                     .description(description)
                     .color(Color::DARK_GREEN)
