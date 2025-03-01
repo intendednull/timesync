@@ -68,10 +68,15 @@ path = "src/main.rs"
 name = "db-migrate"
 path = "src/db_migrate.rs"
 
+[[bin]]
+name = "discord-bot"
+path = "src/discord_bot.rs"
+
 [dependencies]
 timesync-api = { path = "crates/api" }
 timesync-db = { path = "crates/db" }
 timesync-core = { path = "crates/core" }
+timesync-discord-bot = { path = "crates/discord-bot" }
 
 tokio = { workspace = true }
 eyre = { workspace = true }

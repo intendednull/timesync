@@ -1,0 +1,148 @@
+use serenity::{
+    builder::CreateApplicationCommand,
+    model::application::command::CommandOptionType,
+};
+
+/// Create command for generating a new schedule
+pub fn create_schedule_command() -> CreateApplicationCommand {
+    let mut command = CreateApplicationCommand::default();
+    command
+        .name("schedule")
+        .description("Create a new availability schedule")
+        .create_option(|option| {
+            option
+                .name("create")
+                .description("Create a new availability schedule")
+                .kind(CommandOptionType::SubCommand)
+        })
+        .dm_permission(false);
+    
+    command
+}
+
+/// Create command for managing groups
+pub fn group_command() -> CreateApplicationCommand {
+    let mut command = CreateApplicationCommand::default();
+    command
+        .name("group")
+        .description("Manage scheduling groups")
+        .dm_permission(false)
+        // Create subcommand
+        .create_option(|option| {
+            option
+                .name("create")
+                .description("Create a new group of users")
+                .kind(CommandOptionType::SubCommand)
+                .create_sub_option(|sub_option| {
+                    sub_option
+                        .name("name")
+                        .description("Name of the group")
+                        .kind(CommandOptionType::String)
+                        .required(true)
+                })
+                .create_sub_option(|sub_option| {
+                    sub_option
+                        .name("members")
+                        .description("Comma-separated list of mention tags (@user1, @user2) or 'all' for everyone in the current thread")
+                        .kind(CommandOptionType::String)
+                        .required(true)
+                })
+        })
+        // List subcommand
+        .create_option(|option| {
+            option
+                .name("list")
+                .description("List all groups in this server")
+                .kind(CommandOptionType::SubCommand)
+        })
+        // Add subcommand
+        .create_option(|option| {
+            option
+                .name("add")
+                .description("Add users to an existing group")
+                .kind(CommandOptionType::SubCommand)
+                .create_sub_option(|sub_option| {
+                    sub_option
+                        .name("name")
+                        .description("Name of the group")
+                        .kind(CommandOptionType::String)
+                        .required(true)
+                })
+                .create_sub_option(|sub_option| {
+                    sub_option
+                        .name("members")
+                        .description("Comma-separated list of mention tags (@user1, @user2)")
+                        .kind(CommandOptionType::String)
+                        .required(true)
+                })
+        })
+        // Remove subcommand
+        .create_option(|option| {
+            option
+                .name("remove")
+                .description("Remove users from an existing group")
+                .kind(CommandOptionType::SubCommand)
+                .create_sub_option(|sub_option| {
+                    sub_option
+                        .name("name")
+                        .description("Name of the group")
+                        .kind(CommandOptionType::String)
+                        .required(true)
+                })
+                .create_sub_option(|sub_option| {
+                    sub_option
+                        .name("members")
+                        .description("Comma-separated list of mention tags (@user1, @user2)")
+                        .kind(CommandOptionType::String)
+                        .required(true)
+                })
+        })
+        // Info subcommand
+        .create_option(|option| {
+            option
+                .name("info")
+                .description("Show information about a group")
+                .kind(CommandOptionType::SubCommand)
+                .create_sub_option(|sub_option| {
+                    sub_option
+                        .name("name")
+                        .description("Name of the group")
+                        .kind(CommandOptionType::String)
+                        .required(true)
+                })
+        });
+    
+    command
+}
+
+/// Create command for matching available times
+pub fn match_command() -> CreateApplicationCommand {
+    let mut command = CreateApplicationCommand::default();
+    command
+        .name("match")
+        .description("Find common available times between groups")
+        .dm_permission(false)
+        .create_option(|option| {
+            option
+                .name("groups")
+                .description("Comma-separated list of group names")
+                .kind(CommandOptionType::String)
+                .required(true)
+        })
+        .create_option(|option| {
+            option
+                .name("min_per_group")
+                .description("Minimum number of users required from each group")
+                .kind(CommandOptionType::Integer)
+                .required(false)
+        })
+        .create_option(|option| {
+            option
+                .name("count")
+                .description("Number of suggestions to return (default: 5)")
+                .kind(CommandOptionType::Integer)
+                .required(false)
+        });
+    
+    command
+}
