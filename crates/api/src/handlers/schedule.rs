@@ -29,6 +29,7 @@ pub async fn create_schedule(
         &state.db_pool,
         &payload.name,
         password_hash.as_deref(),
+        &payload.timezone,
     )
     .await
     .map_err(TimeError::Database)?;
@@ -40,6 +41,7 @@ pub async fn create_schedule(
             db_schedule.id,
             slot.start,
             slot.end,
+            slot.is_recurring,
         )
         .await
         .map_err(TimeError::Database)?;
@@ -61,6 +63,7 @@ pub async fn create_schedule(
         name: db_schedule.name,
         created_at: db_schedule.created_at,
         is_editable: db_schedule.password_hash.is_some(),
+        timezone: db_schedule.timezone,
     };
 
     Ok(Json(response))
@@ -90,11 +93,13 @@ pub async fn get_schedule(
         name: db_schedule.name,
         created_at: db_schedule.created_at,
         is_editable: db_schedule.password_hash.is_some(),
+        timezone: db_schedule.timezone,
         slots: time_slots
             .into_iter()
             .map(|slot| TimeSlotResponse {
                 start: slot.start_time,
                 end: slot.end_time,
+                is_recurring: slot.is_recurring,
             })
             .collect(),
     };
@@ -134,11 +139,26 @@ pub async fn update_schedule(
         }
     }
 
-    // Update schedule name if provided
+    // Update schedule name and timezone if provided
     if let Some(name) = &payload.name {
-        timesync_db::repositories::schedule::update_schedule(&state.db_pool, id, Some(name))
-            .await
-            .map_err(TimeError::Database)?;
+        timesync_db::repositories::schedule::update_schedule(
+            &state.db_pool, 
+            id, 
+            Some(name),
+            payload.timezone.as_deref(),
+        )
+        .await
+        .map_err(TimeError::Database)?;
+    } else if payload.timezone.is_some() {
+        // Update just the timezone if name is not provided
+        timesync_db::repositories::schedule::update_schedule(
+            &state.db_pool, 
+            id, 
+            None,
+            payload.timezone.as_deref(),
+        )
+        .await
+        .map_err(TimeError::Database)?;
     }
 
     // Update time slots
@@ -154,6 +174,7 @@ pub async fn update_schedule(
             id,
             slot.start,
             slot.end,
+            slot.is_recurring,
         )
         .await
         .map_err(TimeError::Database)?;

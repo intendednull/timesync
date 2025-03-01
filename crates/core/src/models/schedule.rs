@@ -17,12 +17,20 @@ pub struct CreateScheduleRequest {
     #[serde(default)]
     pub slots: Vec<CreateTimeSlotRequest>,
     pub discord_id: Option<String>,
+    #[serde(default = "default_timezone")]
+    pub timezone: String,
+}
+
+fn default_timezone() -> String {
+    "UTC".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateTimeSlotRequest {
     pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,
+    #[serde(default)]
+    pub is_recurring: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +39,7 @@ pub struct CreateScheduleResponse {
     pub name: String,
     pub created_at: DateTime<Utc>,
     pub is_editable: bool,
+    pub timezone: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +48,7 @@ pub struct GetScheduleResponse {
     pub name: String,
     pub created_at: DateTime<Utc>,
     pub is_editable: bool,
+    pub timezone: String,
     pub slots: Vec<TimeSlotResponse>,
 }
 
@@ -46,6 +56,7 @@ pub struct GetScheduleResponse {
 pub struct TimeSlotResponse {
     pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,
+    pub is_recurring: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +64,7 @@ pub struct UpdateScheduleRequest {
     pub name: Option<String>,
     pub slots: Vec<CreateTimeSlotRequest>,
     pub password: Option<String>,
+    pub timezone: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

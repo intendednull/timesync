@@ -31,6 +31,6 @@ async fn version() -> Json<VersionResponse> {
 
 pub fn routes() -> Router<Arc<ApiState>> {
     Router::new()
-        .route("/api/health", get(health_check))
-        .route("/api/version", get(version))
+        .route("/health", get(health_check))
+        .route("/version", get(version))
 }

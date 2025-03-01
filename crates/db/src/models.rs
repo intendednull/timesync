@@ -8,6 +8,7 @@ pub struct DbSchedule {
     pub id: Uuid,
     pub name: String,
     pub password_hash: Option<String>,
+    pub timezone: String,
     pub created_at: DateTime<Utc>,
 }
 
@@ -17,6 +18,7 @@ pub struct DbTimeSlot {
     pub schedule_id: Uuid,
     pub start_time: DateTime<Utc>,
     pub end_time: DateTime<Utc>,
+    pub is_recurring: bool,
     pub created_at: DateTime<Utc>,
 }
 

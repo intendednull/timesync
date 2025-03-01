@@ -5,7 +5,7 @@ use crate::{handlers, ApiState};
 
 pub fn routes() -> Router<Arc<ApiState>> {
     Router::new().route(
-        "/api/availability/match",
+        "/availability/match",
         get(handlers::availability::match_availability),
     )
 }

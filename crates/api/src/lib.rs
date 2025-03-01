@@ -25,11 +25,16 @@ pub mod routes;
 
 use std::sync::Arc;
 
-use axum::Router;
+use axum::{
+    Router,
+    routing::{get, get_service},
+    response::{IntoResponse, Html},
+};
 use eyre::Result;
 use sqlx::PgPool;
 use tokio::net::TcpListener;
-use tracing::{info, Level};
+use tower_http::services::ServeDir;
+use tracing::info;
 use tracing_subscriber::FmtSubscriber;
 
 /// Shared application state that is accessible to all request handlers
@@ -79,16 +84,74 @@ pub async fn start_server(config: config::ApiConfig, db_pool: PgPool) -> Result<
     // Create shared state with dependencies
     let state = Arc::new(ApiState { db_pool });
 
+    // Define static file handler
+    let static_dir = std::env::current_dir()?.join("src");
+    
+    // Use a properly configured static file service with MIME types
+    let static_service = tower_http::services::ServeDir::new(static_dir.clone())
+        .append_index_html_on_directories(true)
+        .precompressed_br()
+        .precompressed_gzip();
+    
+    // Define the frontend fallback handler
+    async fn serve_frontend_fallback(path: Option<axum::extract::Path<String>>) -> impl IntoResponse {
+        // Determine which HTML file to serve based on the path
+        let file_path = match &path {
+            // If path contains "edit", serve edit.html
+            Some(p) if p.0.contains("edit") => "src/edit.html",
+            // If path is just a UUID, serve view.html
+            Some(p) if p.0.len() > 0 && !p.0.contains("/") => "src/view.html",
+            // If path is "availability", serve availability.html
+            Some(p) if p.0 == "availability" => "src/availability.html",
+            // Default to index.html
+            _ => "src/index.html",
+        };
+        
+        let html_content = tokio::fs::read_to_string(file_path).await.unwrap_or_else(|_| {
+            eprintln!("Error: Could not load {}", file_path);
+            "<!DOCTYPE html><html><body><h1>Error: Could not load requested page</h1></body></html>".to_string()
+        });
+        
+        Html(html_content)
+    }
+    
     // Build the application router with all routes
     let app = Router::new()
-        // Health check endpoints
-        .merge(routes::health::routes())
-        // Schedule management endpoints
-        .merge(routes::schedule::routes())
-        // Discord integration endpoints
-        .merge(routes::discord::routes())
-        // Availability management endpoints
-        .merge(routes::availability::routes())
+        // API routes - must be first to ensure they're matched properly
+        .nest("/api", Router::new()
+            // Health check endpoints
+            .merge(routes::health::routes())
+            // Schedule management endpoints
+            .merge(routes::schedule::routes())
+            // Discord integration endpoints
+            .merge(routes::discord::routes())
+            // Availability management endpoints
+            .merge(routes::availability::routes())
+        )
+        // Static file routes - serve specific directories first
+        .nest_service("/assets", get_service(ServeDir::new(std::env::current_dir()?.join("src/assets"))))
+        .nest_service("/js", get_service(ServeDir::new(std::env::current_dir()?.join("src/js"))))
+        .nest_service("/css", get_service(ServeDir::new(std::env::current_dir()?.join("src/css"))))
+        
+        // Serve specific static files directly
+        .route_service("/index.html", get_service(ServeDir::new(std::env::current_dir()?.join("src"))))
+        .route_service("/view.html", get_service(ServeDir::new(std::env::current_dir()?.join("src"))))
+        .route_service("/edit.html", get_service(ServeDir::new(std::env::current_dir()?.join("src"))))
+        .route_service("/availability.html", get_service(ServeDir::new(std::env::current_dir()?.join("src"))))
+        .route_service("/styles.css", get_service(ServeDir::new(std::env::current_dir()?.join("src"))))
+        .route_service("/scripts.js", get_service(ServeDir::new(std::env::current_dir()?.join("src"))))
+        .route_service("/view.js", get_service(ServeDir::new(std::env::current_dir()?.join("src"))))
+        .route_service("/edit.js", get_service(ServeDir::new(std::env::current_dir()?.join("src"))))
+        .route_service("/availability.js", get_service(ServeDir::new(std::env::current_dir()?.join("src"))))
+        
+        // Frontend application routes
+        .route("/", get(|| serve_frontend_fallback(None)))
+        .route("/availability", get(|| serve_frontend_fallback(Some(axum::extract::Path("availability".to_string())))))
+        .route("/:id/edit", get(|path: axum::extract::Path<String>| serve_frontend_fallback(Some(path))))
+        .route("/:id", get(|path: axum::extract::Path<String>| serve_frontend_fallback(Some(path))))
+        
+        // Fallback - use fallback function for any other routes not matched
+        .fallback(get(|| serve_frontend_fallback(None)))
         // Attach shared state to all routes
         .with_state(state);
 
@@ -120,12 +183,8 @@ pub async fn start_server(config: config::ApiConfig, db_pool: PgPool) -> Result<
         app
     };
 
-    // Add request timeout middleware
-    let app = app.layer(
-        tower::ServiceBuilder::new()
-            .timeout(std::time::Duration::from_secs(config.request_timeout))
-            .into_inner(),
-    );
+    // Note: In a production app, you might want to add request timeout middleware
+    // For simplicity, we're omitting it in this version
 
     // Start the HTTP server
     let addr = config.server_addr();

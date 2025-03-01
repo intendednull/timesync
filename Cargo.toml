@@ -11,8 +11,8 @@ resolver = "2"
 # Core server components
 axum = { version = "0.7", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
-tower = "0.4"
-tower-http = { version = "0.5", features = ["cors", "trace"] }
+tower = { version = "0.4", features = ["timeout"] }
+tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
 
 # Database
 sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "uuid", "time", "json", "chrono"] }
@@ -58,6 +58,15 @@ serenity = { version = "0.11", features = ["client", "gateway", "rustls_backend"
 name = "timesync"
 version = "0.1.0"
 edition = "2024"
+
+# Define binary targets
+[[bin]]
+name = "timesync"
+path = "src/main.rs"
+
+[[bin]]
+name = "db-migrate"
+path = "src/db_migrate.rs"
 
 [dependencies]
 timesync-api = { path = "crates/api" }

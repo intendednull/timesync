@@ -18,6 +18,35 @@ pub async fn initialize_database(pool: &Pool<Postgres>) -> Result<()> {
     )
     .execute(pool)
     .await?;
+    
+    // Add timezone column to schedules table if it doesn't exist
+    info!("Checking for timezone column in schedules table...");
+    let column_exists = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT EXISTS (
+            SELECT 1 
+            FROM information_schema.columns 
+            WHERE table_name = 'schedules' AND column_name = 'timezone'
+        );
+        "#,
+    )
+    .fetch_one(pool)
+    .await?;
+    
+    if !column_exists {
+        info!("Adding timezone column to schedules table...");
+        sqlx::query(
+            r#"
+            ALTER TABLE schedules
+            ADD COLUMN timezone VARCHAR(100) DEFAULT 'UTC' NOT NULL;
+            "#,
+        )
+        .execute(pool)
+        .await?;
+        info!("Timezone column added successfully.");
+    } else {
+        info!("Timezone column already exists.");
+    }
 
     // Create time_slots table
     sqlx::query(
@@ -34,6 +63,35 @@ pub async fn initialize_database(pool: &Pool<Postgres>) -> Result<()> {
     )
     .execute(pool)
     .await?;
+    
+    // Add is_recurring column to time_slots table if it doesn't exist
+    info!("Checking for is_recurring column in time_slots table...");
+    let is_recurring_exists = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT EXISTS (
+            SELECT 1 
+            FROM information_schema.columns 
+            WHERE table_name = 'time_slots' AND column_name = 'is_recurring'
+        );
+        "#,
+    )
+    .fetch_one(pool)
+    .await?;
+    
+    if !is_recurring_exists {
+        info!("Adding is_recurring column to time_slots table...");
+        sqlx::query(
+            r#"
+            ALTER TABLE time_slots
+            ADD COLUMN is_recurring BOOLEAN NOT NULL DEFAULT FALSE;
+            "#,
+        )
+        .execute(pool)
+        .await?;
+        info!("is_recurring column added successfully.");
+    } else {
+        info!("is_recurring column already exists.");
+    }
 
     // Create discord_users table
     sqlx::query(
@@ -75,17 +133,45 @@ pub async fn initialize_database(pool: &Pool<Postgres>) -> Result<()> {
     .execute(pool)
     .await?;
 
-    // Create indexes
+    // Create indexes - one at a time
     sqlx::query(
-        r#"
-        CREATE INDEX IF NOT EXISTS idx_time_slots_schedule_id ON time_slots(schedule_id);
-        CREATE INDEX IF NOT EXISTS idx_time_slots_start_time ON time_slots(start_time);
-        CREATE INDEX IF NOT EXISTS idx_time_slots_end_time ON time_slots(end_time);
-        CREATE INDEX IF NOT EXISTS idx_discord_users_schedule_id ON discord_users(schedule_id);
-        CREATE INDEX IF NOT EXISTS idx_group_members_group_id ON group_members(group_id);
-        CREATE INDEX IF NOT EXISTS idx_group_members_discord_id ON group_members(discord_id);
-        CREATE INDEX IF NOT EXISTS idx_discord_groups_server_id ON discord_groups(server_id);
-        "#,
+        "CREATE INDEX IF NOT EXISTS idx_time_slots_schedule_id ON time_slots(schedule_id)"
+    )
+    .execute(pool)
+    .await?;
+    
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_time_slots_start_time ON time_slots(start_time)"
+    )
+    .execute(pool)
+    .await?;
+    
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_time_slots_end_time ON time_slots(end_time)"
+    )
+    .execute(pool)
+    .await?;
+    
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_discord_users_schedule_id ON discord_users(schedule_id)"
+    )
+    .execute(pool)
+    .await?;
+    
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_group_members_group_id ON group_members(group_id)"
+    )
+    .execute(pool)
+    .await?;
+    
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_group_members_discord_id ON group_members(discord_id)"
+    )
+    .execute(pool)
+    .await?;
+    
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_discord_groups_server_id ON discord_groups(server_id)"
     )
     .execute(pool)
     .await?;
