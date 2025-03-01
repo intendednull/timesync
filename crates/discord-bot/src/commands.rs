@@ -1,6 +1,20 @@
 use serenity::builder::CreateApplicationCommands;
+use serenity::framework::standard::macros::{command, group};
+use serenity::framework::standard::{CommandResult, StandardFramework};
+use serenity::model::prelude::*;
+use serenity::prelude::*;
 
 pub mod schedule;
+
+#[group]
+#[commands(ping)]
+struct General;
+
+#[command]
+async fn ping(ctx: &Context, msg: &Message) -> CommandResult {
+    msg.reply(ctx, "Pong!").await?;
+    Ok(())
+}
 
 /// Register all commands for the bot.
 ///

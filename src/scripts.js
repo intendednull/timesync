@@ -14,6 +14,14 @@ document.addEventListener('DOMContentLoaded', () => {
     // Date handling
     let currentWeekStart = getStartOfWeek(new Date());
     
+    // Check for discord_id parameter in URL
+    const urlParams = new URLSearchParams(window.location.search);
+    const discordId = urlParams.get('discord_id');
+    if (discordId) {
+        // Set the discord_id field if it exists in the URL
+        document.getElementById('discord-id').value = discordId;
+    }
+    
     // Initialize timezone selector
     populateTimezoneSelector();
     
@@ -395,51 +403,111 @@ document.addEventListener('DOMContentLoaded', () => {
         // Convert selected times to slot format
         const slots = [];
         const sortedTimes = Array.from(selectedTimeSlots).sort();
-        
-        let startTime = null;
-        let endTime = null;
-        
-        // Sort time slots chronologically
         const sortedDates = sortedTimes.map(time => new Date(time)).sort((a, b) => a - b);
         console.log('Sorted dates:', sortedDates.map(d => d.toISOString()));
         
-        // Merge adjacent time slots with simplified approach
-        if (sortedDates.length > 0) {
-            startTime = sortedDates[0];
-            endTime = new Date(startTime);
-            endTime.setHours(endTime.getHours() + 1);
+        if (isRecurringMode) {
+            // Group dates by day of week
+            const dayGroups = new Map(); // Map of day of week -> array of dates
             
-            for (let i = 1; i < sortedDates.length; i++) {
-                const currentTime = sortedDates[i];
-                const previousEndTime = new Date(endTime);
+            sortedDates.forEach(date => {
+                const dayOfWeek = date.getDay();
+                if (!dayGroups.has(dayOfWeek)) {
+                    dayGroups.set(dayOfWeek, []);
+                }
+                dayGroups.get(dayOfWeek).push(date);
+            });
+            
+            // Process each day group
+            for (const [dayOfWeek, dates] of dayGroups.entries()) {
+                // Sort dates within each day group by hour
+                dates.sort((a, b) => a.getHours() - b.getHours());
                 
-                // Check if this slot is adjacent to the previous one
-                if (currentTime.getTime() === previousEndTime.getTime()) {
-                    // Extend the current time slot
-                    endTime.setHours(endTime.getHours() + 1);
-                } else {
-                    // Add the completed slot
+                let startTime = null;
+                let endTime = null;
+                
+                // Process slots for this day of week
+                for (let i = 0; i < dates.length; i++) {
+                    const currentDate = dates[i];
+                    
+                    if (startTime === null) {
+                        // Start a new slot
+                        startTime = currentDate;
+                        endTime = new Date(startTime);
+                        endTime.setHours(endTime.getHours() + 1);
+                    } else {
+                        // Check if this is adjacent to the previous slot
+                        const expectedHour = endTime.getHours();
+                        if (currentDate.getHours() === expectedHour) {
+                            // Extend the current slot
+                            endTime.setHours(endTime.getHours() + 1);
+                        } else {
+                            // Add the completed slot and start a new one
+                            slots.push({
+                                start: startTime.toISOString(),
+                                end: endTime.toISOString(),
+                                is_recurring: true
+                            });
+                            
+                            startTime = currentDate;
+                            endTime = new Date(startTime);
+                            endTime.setHours(endTime.getHours() + 1);
+                        }
+                    }
+                }
+                
+                // Add the last slot for this day
+                if (startTime !== null) {
                     slots.push({
                         start: startTime.toISOString(),
                         end: endTime.toISOString(),
-                        is_recurring: isRecurringMode
+                        is_recurring: true
                     });
-                    
-                    // Start a new slot
-                    startTime = currentTime;
-                    endTime = new Date(currentTime);
-                    endTime.setHours(endTime.getHours() + 1);
                 }
             }
-        }
-        
-        // Add the last slot if there is one
-        if (startTime !== null) {
-            slots.push({
-                start: startTime.toISOString(),
-                end: endTime.toISOString(),
-                is_recurring: isRecurringMode
-            });
+        } else {
+            // Non-recurring mode - process chronologically
+            let startTime = null;
+            let endTime = null;
+            
+            // Merge adjacent time slots with simplified approach
+            if (sortedDates.length > 0) {
+                startTime = sortedDates[0];
+                endTime = new Date(startTime);
+                endTime.setHours(endTime.getHours() + 1);
+                
+                for (let i = 1; i < sortedDates.length; i++) {
+                    const currentTime = sortedDates[i];
+                    const previousEndTime = new Date(endTime);
+                    
+                    // Check if this slot is adjacent to the previous one
+                    if (currentTime.getTime() === previousEndTime.getTime()) {
+                        // Extend the current time slot
+                        endTime.setHours(endTime.getHours() + 1);
+                    } else {
+                        // Add the completed slot
+                        slots.push({
+                            start: startTime.toISOString(),
+                            end: endTime.toISOString(),
+                            is_recurring: false
+                        });
+                        
+                        // Start a new slot
+                        startTime = currentTime;
+                        endTime = new Date(currentTime);
+                        endTime.setHours(endTime.getHours() + 1);
+                    }
+                }
+            }
+            
+            // Add the last slot if there is one
+            if (startTime !== null) {
+                slots.push({
+                    start: startTime.toISOString(),
+                    end: endTime.toISOString(),
+                    is_recurring: false
+                });
+            }
         }
         
         // Validate slots before sending

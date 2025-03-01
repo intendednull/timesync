@@ -2,6 +2,7 @@ use eyre::Result;
 use serenity::{
     Client, 
     prelude::GatewayIntents,
+    framework::StandardFramework,
 };
 use sqlx::PgPool;
 use tracing::info;
@@ -30,9 +31,15 @@ pub async fn start_bot(config: config::BotConfig, db_pool: PgPool) -> Result<()>
     // Create a new Discord client
     let handler = handlers::Handler::new(config.clone(), db_pool);
     
+    // Create a framework
+    let framework = StandardFramework::new()
+        .configure(|c| c.prefix("!"))  // Set the prefix to !
+        .group(&commands::GENERAL_GROUP);
+    
     // Configure the client
     let mut client = Client::builder(&config.token, GatewayIntents::non_privileged())
         .event_handler(handler)
+        .framework(framework)  // Add the framework
         .await?;
         
     // Start the client

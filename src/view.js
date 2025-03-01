@@ -99,6 +99,9 @@ document.addEventListener('DOMContentLoaded', () => {
         currentTimezone = event.target.value;
         renderTimeGrid();
         updateDateRange();
+        
+        // Debug log current timezone
+        console.log('Changed timezone to:', currentTimezone);
     });
     
     // Functions
@@ -183,6 +186,18 @@ document.addEventListener('DOMContentLoaded', () => {
             
             scheduleData = await response.json();
             
+            // Debug log the slots
+            console.log('Loaded schedule data:', scheduleData);
+            if (scheduleData.slots) {
+                scheduleData.slots.forEach((slot, index) => {
+                    console.log(`Slot ${index}:`, {
+                        start: new Date(slot.start).toLocaleString(),
+                        end: new Date(slot.end).toLocaleString(),
+                        is_recurring: slot.is_recurring
+                    });
+                });
+            }
+            
             // Update UI with schedule data
             document.getElementById('schedule-name').textContent = scheduleData.name;
             document.getElementById('created-at').textContent = new Date(scheduleData.created_at).toLocaleString();
@@ -257,63 +272,121 @@ document.addEventListener('DOMContentLoaded', () => {
             timeGrid.appendChild(dayHeader);
         }
         
-        // Create time rows (all 24 hours in 30-minute increments)
+        // Create time rows (all 24 hours in 1-hour increments)
         for (let hour = 0; hour < 24; hour++) {
-            for (let minute = 0; minute < 60; minute += 30) {
-                const timeLabel = document.createElement('div');
-                timeLabel.classList.add('time-label');
-                timeLabel.textContent = formatTime(hour, minute);
-                timeGrid.appendChild(timeLabel);
+            const minute = 0; // Only use whole hours
+            const timeLabel = document.createElement('div');
+            timeLabel.classList.add('time-label');
+            timeLabel.textContent = formatTime(hour, minute);
+            timeGrid.appendChild(timeLabel);
+            
+            // Create cells for each day
+            for (let day = 0; day < 7; day++) {
+                const cell = document.createElement('div');
+                cell.classList.add('grid-cell');
                 
-                // Create cells for each day
-                for (let day = 0; day < 7; day++) {
-                    const cell = document.createElement('div');
-                    cell.classList.add('grid-cell');
-                    
-                    // Store date and time info as data attributes
-                    const cellDate = new Date(currentWeekStart);
-                    cellDate.setDate(cellDate.getDate() + day);
-                    cellDate.setHours(hour, minute, 0, 0);
-                    
-                    // Check if this time slot is in the schedule
-                    if (scheduleData && scheduleData.slots) {
-                        const isAvailable = scheduleData.slots.some(slot => {
-                            const slotStart = new Date(slot.start);
-                            const slotEnd = new Date(slot.end);
+                // Store date and time info as data attributes
+                const cellDate = new Date(currentWeekStart);
+                cellDate.setDate(cellDate.getDate() + day);
+                cellDate.setHours(hour, minute, 0, 0);
+                
+                // Check if this time slot is in the schedule
+                if (scheduleData && scheduleData.slots) {
+                    const isAvailable = scheduleData.slots.some(slot => {
+                        // Convert slot times from UTC to the selected timezone
+                        const slotStart = convertToTimezone(new Date(slot.start), currentTimezone);
+                        const slotEnd = convertToTimezone(new Date(slot.end), currentTimezone);
+                        
+                        if (slot.is_recurring) {
+                            // For recurring slots, we need to match the day of week and hour
+                            const cellDay = cellDate.getDay();
+                            const slotDay = slotStart.getDay();
+                            const isSameDay = cellDay === slotDay;
                             
-                            if (slot.is_recurring) {
-                                // For recurring slots, just compare day of week and time
-                                const isSameDay = slotStart.getDay() === cellDate.getDay();
-                                const isSameTime = 
-                                    slotStart.getHours() === cellDate.getHours() && 
-                                    slotStart.getMinutes() === cellDate.getMinutes();
-                                
-                                return isSameDay && isSameTime;
+                            if (!isSameDay) return false;
+                            
+                            // Get hours only (ignoring minutes for 1-hour increments)
+                            const cellHour = cellDate.getHours();
+                            const slotStartHour = slotStart.getHours();
+                            const slotEndHour = slotEnd.getHours();
+                            
+                            // Handle day wrapping (if end time is on next day)
+                            if (slotStartHour >= slotEndHour && slotEndHour > 0) {
+                                // If slot crosses midnight (e.g., 10 PM - 2 AM)
+                                return cellHour >= slotStartHour || cellHour < slotEndHour;
                             } else {
-                                // For specific dates, check if the date falls within the slot
-                                return cellDate >= slotStart && cellDate < slotEnd;
+                                // Normal case (e.g., 9 AM - 5 PM)
+                                return cellHour >= slotStartHour && cellHour < slotEndHour;
+                            }
+                        } else {
+                            // For specific dates, we need to compare dates accounting for timezone
+                            
+                            // Create datetime objects with current timezone
+                            const cellDateTime = new Date(
+                                cellDate.getFullYear(),
+                                cellDate.getMonth(),
+                                cellDate.getDate(),
+                                cellDate.getHours()
+                            );
+                            
+                            // Get the slot start/end in current timezone
+                            const slotStartDateTime = new Date(
+                                slotStart.getFullYear(),
+                                slotStart.getMonth(),
+                                slotStart.getDate(),
+                                slotStart.getHours()
+                            );
+                            
+                            const slotEndDateTime = new Date(
+                                slotEnd.getFullYear(),
+                                slotEnd.getMonth(),
+                                slotEnd.getDate(),
+                                slotEnd.getHours()
+                            );
+                            
+                            // Compare date-hour in current timezone
+                            return cellDateTime >= slotStartDateTime && cellDateTime < slotEndDateTime;
+                        }
+                    });
+                    
+                    if (isAvailable) {
+                        cell.classList.add('selected');
+                        
+                        // Add a recurring indicator if applicable
+                        const isRecurring = scheduleData.slots.some(slot => {
+                            if (!slot.is_recurring) return false;
+                            
+                            // Convert slot times from UTC to the selected timezone
+                            const slotStart = convertToTimezone(new Date(slot.start), currentTimezone);
+                            const slotEnd = convertToTimezone(new Date(slot.end), currentTimezone);
+                            
+                            // Check day of week
+                            const cellDay = cellDate.getDay();
+                            const slotDay = slotStart.getDay();
+                            if (cellDay !== slotDay) return false;
+                            
+                            // Check hour only (for 1-hour increments)
+                            const cellHour = cellDate.getHours();
+                            const slotStartHour = slotStart.getHours();
+                            const slotEndHour = slotEnd.getHours();
+                            
+                            // Handle day wrapping (if end time is on next day)
+                            if (slotStartHour >= slotEndHour && slotEndHour > 0) {
+                                // If slot crosses midnight (e.g., 10 PM - 2 AM)
+                                return cellHour >= slotStartHour || cellHour < slotEndHour;
+                            } else {
+                                // Normal case (e.g., 9 AM - 5 PM)
+                                return cellHour >= slotStartHour && cellHour < slotEndHour;
                             }
                         });
                         
-                        if (isAvailable) {
-                            cell.classList.add('selected');
-                            
-                            // Add a recurring indicator if applicable
-                            const isRecurring = scheduleData.slots.some(slot => 
-                                slot.is_recurring && 
-                                new Date(slot.start).getDay() === cellDate.getDay() &&
-                                new Date(slot.start).getHours() === cellDate.getHours() && 
-                                new Date(slot.start).getMinutes() === cellDate.getMinutes()
-                            );
-                            
-                            if (isRecurring) {
-                                cell.classList.add('recurring');
-                            }
+                        if (isRecurring) {
+                            cell.classList.add('recurring');
                         }
                     }
-                    
-                    timeGrid.appendChild(cell);
                 }
+                
+                timeGrid.appendChild(cell);
             }
         }
     }
@@ -322,5 +395,55 @@ document.addEventListener('DOMContentLoaded', () => {
         const period = hour >= 12 ? 'PM' : 'AM';
         const displayHour = hour % 12 || 12;
         return `${displayHour}:${minute.toString().padStart(2, '0')} ${period}`;
+    }
+    
+    /**
+     * Converts a date to the specified timezone
+     * @param {Date} date - The date to convert
+     * @param {string} timezone - The timezone to convert to
+     * @returns {Date} - A new Date object in the specified timezone
+     */
+    function convertToTimezone(date, timezone) {
+        // Get ISO string in the desired timezone
+        const options = { timeZone: timezone };
+        
+        // If invalid timezone, fallback to local
+        try {
+            // Create a formatter for each part of the date
+            const yearFormatter = new Intl.DateTimeFormat('en-US', { ...options, year: 'numeric' });
+            const monthFormatter = new Intl.DateTimeFormat('en-US', { ...options, month: 'numeric' });
+            const dayFormatter = new Intl.DateTimeFormat('en-US', { ...options, day: 'numeric' });
+            const hourFormatter = new Intl.DateTimeFormat('en-US', { ...options, hour: 'numeric', hour12: false });
+            const minuteFormatter = new Intl.DateTimeFormat('en-US', { ...options, minute: 'numeric' });
+            
+            // Extract components in the target timezone
+            const year = parseInt(yearFormatter.format(date));
+            const month = parseInt(monthFormatter.format(date)) - 1; // Months are 0-indexed in JS
+            const day = parseInt(dayFormatter.format(date));
+            
+            // Handle hour format which includes AM/PM
+            let hour = parseInt(hourFormatter.format(date));
+            if (isNaN(hour)) {
+                // Fallback if formatter returned invalid hour
+                const fullTime = new Intl.DateTimeFormat('en-US', { ...options, hour: 'numeric', minute: 'numeric' }).format(date);
+                const timeParts = fullTime.split(':');
+                hour = parseInt(timeParts[0]);
+                
+                // Handle AM/PM
+                if (fullTime.toLowerCase().includes('pm') && hour < 12) {
+                    hour += 12;
+                } else if (fullTime.toLowerCase().includes('am') && hour === 12) {
+                    hour = 0;
+                }
+            }
+            
+            const minute = parseInt(minuteFormatter.format(date));
+            
+            // Create new date with timezone-adjusted components
+            return new Date(year, month, day, hour, minute);
+        } catch (error) {
+            console.error('Error converting timezone:', error);
+            return date; // Return original date if conversion fails
+        }
     }
 });

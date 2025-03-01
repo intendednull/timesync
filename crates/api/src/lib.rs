@@ -103,6 +103,8 @@ pub async fn start_server(config: config::ApiConfig, db_pool: PgPool) -> Result<
             Some(p) if p.0.len() > 0 && !p.0.contains("/") => "src/view.html",
             // If path is "availability", serve availability.html
             Some(p) if p.0 == "availability" => "src/availability.html",
+            // If path is "create", serve index.html (this is for discord integration)
+            Some(p) if p.0 == "create" => "src/index.html",
             // Default to index.html
             _ => "src/index.html",
         };
@@ -147,6 +149,14 @@ pub async fn start_server(config: config::ApiConfig, db_pool: PgPool) -> Result<
         // Frontend application routes
         .route("/", get(|| serve_frontend_fallback(None)))
         .route("/availability", get(|| serve_frontend_fallback(Some(axum::extract::Path("availability".to_string())))))
+        .route("/create", get(|| async { 
+            // For /create path, always render the index.html directly without treating "create" as an ID
+            let html_content = tokio::fs::read_to_string("src/index.html").await.unwrap_or_else(|_| {
+                eprintln!("Error: Could not load src/index.html");
+                "<!DOCTYPE html><html><body><h1>Error: Could not load requested page</h1></body></html>".to_string()
+            });
+            Html(html_content)
+        }))
         .route("/:id/edit", get(|path: axum::extract::Path<String>| serve_frontend_fallback(Some(path))))
         .route("/:id", get(|path: axum::extract::Path<String>| serve_frontend_fallback(Some(path))))
         
