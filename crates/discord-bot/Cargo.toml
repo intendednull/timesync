@@ -1,0 +1,25 @@
+[package]
+name = "timesync-discord-bot"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+timesync-core = { path = "../core" }
+timesync-db = { path = "../db" }
+
+# Discord API
+serenity = { workspace = true }
+
+# Error handling
+eyre = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Utilities
+chrono = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }

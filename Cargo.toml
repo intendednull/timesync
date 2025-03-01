@@ -1,0 +1,72 @@
+[workspace]
+members = [
+    "crates/api",
+    "crates/db",
+    "crates/core",
+    "crates/discord-bot",
+]
+resolver = "2"
+
+[workspace.dependencies]
+# Core server components
+axum = { version = "0.7", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+
+# Database
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "uuid", "time", "json", "chrono"] }
+
+# Error handling
+eyre = "0.6"
+color-eyre = "0.6"
+thiserror = "1.0"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Authentication
+argon2 = "0.5"
+rand = "0.8"
+
+# Utilities
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1.4", features = ["serde", "v4"] }
+dotenv = "0.15"
+config = "0.13"
+async-trait = "0.1"
+
+# Testing
+pretty_assertions = "1.4"
+serde_test = "1.0"
+mockall = "0.11"
+tokio-test = "0.4"
+tower-test = "0.4"
+axum-test = "14.0"
+test-log = { version = "0.2", features = ["trace"] }
+tempfile = "3.8"
+fake = { version = "2.9", features = ["chrono", "uuid"] }
+rstest = "0.18"
+
+# Discord bot
+serenity = { version = "0.11", features = ["client", "gateway", "rustls_backend", "model"] }
+
+[package]
+name = "timesync"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+timesync-api = { path = "crates/api" }
+timesync-db = { path = "crates/db" }
+timesync-core = { path = "crates/core" }
+
+tokio = { workspace = true }
+eyre = { workspace = true }
+color-eyre = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+dotenv = { workspace = true }

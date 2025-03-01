@@ -1,0 +1,25 @@
+[package]
+name = "timesync-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+eyre = { workspace = true }
+thiserror = { workspace = true }
+
+# Utilities
+chrono = { workspace = true }
+uuid = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+# Testing
+pretty_assertions = { workspace = true }
+serde_test = { workspace = true }
+rstest = { workspace = true }
+fake = { workspace = true }

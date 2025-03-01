@@ -1,0 +1,36 @@
+[package]
+name = "timesync-db"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+timesync-core = { path = "../core" }
+
+# Database
+sqlx = { workspace = true, features = ["chrono", "uuid"] }
+
+# Error handling
+eyre = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Authentication
+argon2 = { workspace = true }
+
+# Utilities
+chrono = { workspace = true }
+uuid = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+mockall = { workspace = true }
+
+[dev-dependencies]
+# Testing
+pretty_assertions = { workspace = true }
+tokio-test = { workspace = true }
+tempfile = { workspace = true }
+rstest = { workspace = true }
+fake = { workspace = true }

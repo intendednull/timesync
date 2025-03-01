@@ -1,0 +1,1 @@
+// Discord bot configuration - to be implemented in future phases
