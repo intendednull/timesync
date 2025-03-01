@@ -7,6 +7,7 @@ use timesync_core::{
         CreateDiscordGroupRequest, CreateDiscordGroupResponse, CreateDiscordUserRequest,
         CreateDiscordUserResponse, DiscordGroupMember, GetDiscordGroupResponse,
         GetDiscordUserResponse, UpdateDiscordGroupRequest, UpdateDiscordGroupResponse,
+        UpdateDiscordGroupRoleRequest, UpdateDiscordGroupRoleResponse,
     },
 };
 use uuid::Uuid;
@@ -83,6 +84,7 @@ pub async fn create_discord_group(
         &state.db_pool,
         &payload.name,
         &payload.server_id,
+        None, // Initially no role_id; it will be set by the Discord bot
     )
     .await
     .map_err(TimeError::Database)?;
@@ -121,6 +123,7 @@ pub async fn create_discord_group(
         id: db_discord_group.id,
         name: db_discord_group.name,
         server_id: db_discord_group.server_id,
+        role_id: db_discord_group.role_id,
     };
 
     Ok(Json(response))
@@ -170,6 +173,7 @@ pub async fn get_discord_group(
         id: db_discord_group.id,
         name: db_discord_group.name,
         server_id: db_discord_group.server_id,
+        role_id: db_discord_group.role_id,
         members,
     };
 
@@ -198,7 +202,7 @@ pub async fn update_discord_group(
 
     // Update group name if provided
     if let Some(name) = &payload.name {
-        timesync_db::repositories::discord::update_discord_group(&state.db_pool, id, Some(name))
+        timesync_db::repositories::discord::update_discord_group(&state.db_pool, id, Some(name), None)
             .await
             .map_err(TimeError::Database)?;
     }
@@ -248,6 +252,31 @@ pub async fn update_discord_group(
 
     let response = UpdateDiscordGroupResponse {
         id,
+        updated_at: chrono::Utc::now(),
+    };
+
+    Ok(Json(response))
+}
+
+#[axum::debug_handler]
+pub async fn update_discord_group_role(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<UpdateDiscordGroupRoleRequest>,
+) -> Result<Json<UpdateDiscordGroupRoleResponse>, AppError> {
+    // Update the role ID for the group
+    // Update the group's role ID
+    let _updated_group = timesync_db::repositories::discord::update_group_role_id(
+        &state.db_pool,
+        id,
+        &payload.role_id,
+    )
+    .await
+    .map_err(TimeError::Database)?;
+
+    let response = UpdateDiscordGroupRoleResponse {
+        id,
+        role_id: payload.role_id,
         updated_at: chrono::Utc::now(),
     };
 

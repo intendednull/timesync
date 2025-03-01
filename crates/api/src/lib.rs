@@ -88,7 +88,7 @@ pub async fn start_server(config: config::ApiConfig, db_pool: PgPool) -> Result<
     let static_dir = std::env::current_dir()?.join("src");
     
     // Use a properly configured static file service with MIME types
-    let static_service = tower_http::services::ServeDir::new(static_dir.clone())
+    let _static_service = tower_http::services::ServeDir::new(static_dir.clone())
         .append_index_html_on_directories(true)
         .precompressed_br()
         .precompressed_gzip();

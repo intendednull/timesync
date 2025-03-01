@@ -11,7 +11,7 @@ use serenity::{
     },
     utils::Color,
 };
-use timesync_core::models::discord::CreateDiscordGroupRequest;
+use timesync_core::models::discord::{CreateDiscordGroupRequest, CreateDiscordGroupResponse};
 use std::collections::HashMap;
 use std::str::FromStr;
 use sqlx::Row;
@@ -135,14 +135,13 @@ async fn handle_group_create(
     }
     
     // Get the guild (server) ID
-    let server_id = command.guild_id
-        .ok_or_else(|| eyre::eyre!("Command must be used in a server"))?
-        .to_string();
+    let guild_id = command.guild_id
+        .ok_or_else(|| eyre::eyre!("Command must be used in a server"))?;
     
     // Create the request payload
     let request = CreateDiscordGroupRequest {
         name: name.clone(),
-        server_id,
+        server_id: guild_id.to_string(),
         member_ids: member_ids.clone(),
     };
     
@@ -158,6 +157,37 @@ async fn handle_group_create(
         return Err(eyre::eyre!("Failed to create group: {}", error_text));
     }
     
+    // Parse the response to get the group ID
+    let group_response: CreateDiscordGroupResponse = response.json().await?;
+    
+    // Create a Discord role for the group
+    let guild = command.guild_id.unwrap().to_guild_cached(&ctx.ctx)
+        .ok_or_else(|| eyre::eyre!("Failed to get guild"))?;
+    
+    // Create the role (using just the group name)
+    let role = guild.create_role(&ctx.ctx.http, |r| {
+        r.name(name.clone())
+         .colour(0x3498db) // Blue color
+         .hoist(false)     // Don't display separately
+         .mentionable(true)
+    }).await?;
+    
+    // Store the role ID in the database
+    client.put(format!("{}/api/discord/groups/{}/role", ctx.config.web_base_url, group_response.id))
+        .json(&serde_json::json!({ "role_id": role.id.to_string() }))
+        .send()
+        .await?;
+    
+    // Assign the role to all members in the group
+    for member_id in &member_ids {
+        if let Ok(user_id) = member_id.parse::<u64>() {
+            if let Ok(mut member) = guild.member(&ctx.ctx.http, user_id).await {
+                // Ignore errors when adding roles to allow the process to continue
+                let _ = member.add_role(&ctx.ctx.http, role.id).await;
+            }
+        }
+    }
+    
     // Respond to the interaction
     command.create_interaction_response(&ctx.ctx.http, |r| {
         r.kind(InteractionResponseType::ChannelMessageWithSource)
@@ -166,6 +196,7 @@ async fn handle_group_create(
                     e.title("Scheduling Group Created")
                         .description(format!("Group **{}** has been created with {} members", name, member_ids.len()))
                         .field("Members", format_member_list(&member_ids), false)
+                        .field("Discord Role", format!("<@&{}>", role.id), false)
                         .color(Color::DARK_GREEN)
                         .timestamp(Utc::now().to_rfc3339())
                 })
@@ -218,8 +249,21 @@ async fn handle_group_list(
         .count
         .unwrap_or(0) as i64;
         
-        description.push_str(&format!("**{}** - {} {}\n", 
+        // Get the role ID for this group
+        let role_id: Option<String> = sqlx::query(
+            "SELECT role_id FROM discord_groups WHERE id = $1"
+        )
+        .bind(group.id)
+        .fetch_optional(&ctx.db_pool)
+        .await?
+        .and_then(|row| row.try_get("role_id").ok())
+        .flatten();
+        
+        let role_mention = role_id.map(|id| format!(" <@&{}>", id)).unwrap_or_default();
+        
+        description.push_str(&format!("**{}**{} - {} {}\n", 
             group.name, 
+            role_mention,
             count,
             if count == 1 { "member" } else { "members" }
         ));
@@ -233,7 +277,7 @@ async fn handle_group_list(
                     e.title("Scheduling Groups")
                         .description(description)
                         .color(Color::BLUE)
-                        .footer(|f| f.text("Use /group info <name> to see details about a specific group"))
+                        .footer(|f| f.text("Use /group info <n> to see details about a specific group"))
                 })
             })
     }).await?;
@@ -253,10 +297,9 @@ async fn handle_group_add(
     // Get the members option
     let members_str = get_option_string(subcommand, "members")?;
     
-    // Get the guild (server) ID
-    let server_id = command.guild_id
-        .ok_or_else(|| eyre::eyre!("Command must be used in a server"))?
-        .to_string();
+    // Get the guild
+    let guild_id = command.guild_id
+        .ok_or_else(|| eyre::eyre!("Command must be used in a server"))?;
     
     // Parse the mention tags
     let member_ids = parse_mention_tags(&members_str);
@@ -272,16 +315,30 @@ async fn handle_group_add(
         return Ok(());
     }
     
-    // Find the group by name in this server
-    let group_id = sqlx::query!(
-        "SELECT id FROM discord_groups WHERE name = $1 AND server_id = $2",
-        name,
-        server_id
+    // Find the group by name in this server using basic query to avoid sqlx compile-time checks
+    let group_row = sqlx::query(
+        "SELECT id, role_id FROM discord_groups WHERE name = $1 AND server_id = $2"
     )
+    .bind(name.clone())
+    .bind(guild_id.to_string())
     .fetch_optional(&ctx.db_pool)
     .await?
-    .ok_or_else(|| eyre::eyre!("Group not found"))?
-    .id;
+    .ok_or_else(|| eyre::eyre!("Group not found"))?;
+    
+    let group_id = group_row.get::<uuid::Uuid, _>("id");
+    let group_role_id: Option<String> = group_row.try_get("role_id").ok();
+    
+    // Create a simple struct to hold the data
+    #[derive(Clone)]
+    struct GroupInfo {
+        id: uuid::Uuid,
+        role_id: Option<String>,
+    }
+    
+    let group = GroupInfo {
+        id: group_id,
+        role_id: group_role_id,
+    };
     
     // Make the request to update the group
     let update_request = timesync_core::models::discord::UpdateDiscordGroupRequest {
@@ -292,7 +349,7 @@ async fn handle_group_add(
     
     // Make API request to update the group
     let client = reqwest::Client::new();
-    let response = client.put(format!("{}/api/discord/groups/{}", ctx.config.web_base_url, group_id))
+    let response = client.put(format!("{}/api/discord/groups/{}", ctx.config.web_base_url, group.id))
         .json(&update_request)
         .send()
         .await?;
@@ -300,6 +357,25 @@ async fn handle_group_add(
     if !response.status().is_success() {
         let error_text = response.text().await?;
         return Err(eyre::eyre!("Failed to update group: {}", error_text));
+    }
+    
+    // Get the guild
+    let guild = guild_id.to_guild_cached(&ctx.ctx)
+        .ok_or_else(|| eyre::eyre!("Failed to get guild"))?;
+    
+    // Assign the role to new members if the group has a role
+    if let Some(role_id_str) = &group.role_id {
+        if let Ok(role_id) = role_id_str.parse::<u64>() {
+            // Assign role to all new members
+            for member_id in &member_ids {
+                if let Ok(user_id) = member_id.parse::<u64>() {
+                    if let Ok(mut member) = guild.member(&ctx.ctx.http, user_id).await {
+                        // Ignore errors when adding roles to allow the process to continue
+                        let _ = member.add_role(&ctx.ctx.http, role_id).await;
+                    }
+                }
+            }
+        }
     }
     
     // Respond to the interaction
@@ -335,10 +411,9 @@ async fn handle_group_remove(
     // Get the members option
     let members_str = get_option_string(subcommand, "members")?;
     
-    // Get the guild (server) ID
-    let server_id = command.guild_id
-        .ok_or_else(|| eyre::eyre!("Command must be used in a server"))?
-        .to_string();
+    // Get the guild
+    let guild_id = command.guild_id
+        .ok_or_else(|| eyre::eyre!("Command must be used in a server"))?;
     
     // Parse the mention tags
     let member_ids = parse_mention_tags(&members_str);
@@ -354,16 +429,49 @@ async fn handle_group_remove(
         return Ok(());
     }
     
-    // Find the group by name in this server
-    let group_id = sqlx::query!(
-        "SELECT id FROM discord_groups WHERE name = $1 AND server_id = $2",
-        name,
-        server_id
+    // Find the group by name in this server using basic query to avoid sqlx compile-time checks
+    let group_row = sqlx::query(
+        "SELECT id, role_id FROM discord_groups WHERE name = $1 AND server_id = $2"
     )
+    .bind(name.clone())
+    .bind(guild_id.to_string())
     .fetch_optional(&ctx.db_pool)
     .await?
-    .ok_or_else(|| eyre::eyre!("Group not found"))?
-    .id;
+    .ok_or_else(|| eyre::eyre!("Group not found"))?;
+    
+    let group_id = group_row.get::<uuid::Uuid, _>("id");
+    let group_role_id: Option<String> = group_row.try_get("role_id").ok();
+    
+    // Create a simple struct to hold the data
+    #[derive(Clone)]
+    struct GroupInfo {
+        id: uuid::Uuid,
+        role_id: Option<String>,
+    }
+    
+    let group = GroupInfo {
+        id: group_id,
+        role_id: group_role_id,
+    };
+    
+    // Get the guild
+    let guild = guild_id.to_guild_cached(&ctx.ctx)
+        .ok_or_else(|| eyre::eyre!("Failed to get guild"))?;
+    
+    // Remove the role from members if the group has a role
+    if let Some(role_id_str) = &group.role_id {
+        if let Ok(role_id) = role_id_str.parse::<u64>() {
+            // Remove role from all members being removed
+            for member_id in &member_ids {
+                if let Ok(user_id) = member_id.parse::<u64>() {
+                    if let Ok(mut member) = guild.member(&ctx.ctx.http, user_id).await {
+                        // Ignore errors when removing roles to allow the process to continue
+                        let _ = member.remove_role(&ctx.ctx.http, role_id).await;
+                    }
+                }
+            }
+        }
+    }
     
     // Make the request to update the group
     let update_request = timesync_core::models::discord::UpdateDiscordGroupRequest {
@@ -374,7 +482,7 @@ async fn handle_group_remove(
     
     // Make API request to update the group
     let client = reqwest::Client::new();
-    let response = client.put(format!("{}/api/discord/groups/{}", ctx.config.web_base_url, group_id))
+    let response = client.put(format!("{}/api/discord/groups/{}", ctx.config.web_base_url, group.id))
         .json(&update_request)
         .send()
         .await?;
@@ -440,6 +548,16 @@ async fn handle_group_info(
     .fetch_all(&ctx.db_pool)
     .await?;
     
+    // Get the role information using basic query to avoid sqlx compile-time checks
+    let role_row = sqlx::query(
+        "SELECT role_id FROM discord_groups WHERE id = $1"
+    )
+    .bind(group.id)
+    .fetch_one(&ctx.db_pool)
+    .await?;
+    
+    let role_id: Option<String> = role_row.try_get("role_id").ok();
+    
     // Create a formatted list of members
     let mut members_list = String::new();
     let mut with_schedule = 0;
@@ -460,17 +578,28 @@ async fn handle_group_info(
         members_list = "No members in this group yet".to_string();
     }
     
+    // Create description text
+    let description = format!(
+        "This group has {} members, {} of which have availability schedules.",
+        members.len(),
+        with_schedule
+    );
+    
+    // Add role information if available
+    let role_field = if let Some(role_id_str) = &role_id {
+        format!("<@&{}>", role_id_str)
+    } else {
+        "No role assigned".to_string()
+    };
+    
     // Respond to the interaction
     command.create_interaction_response(&ctx.ctx.http, |r| {
         r.kind(InteractionResponseType::ChannelMessageWithSource)
             .interaction_response_data(|m| {
                 m.embed(|e| {
                     e.title(format!("Group: {}", group.name))
-                        .description(format!(
-                            "This group has {} members, {} of which have availability schedules.",
-                            members.len(),
-                            with_schedule
-                        ))
+                        .description(description)
+                        .field("Discord Role", role_field, false)
                         .field(
                             "Members (✅ = has schedule, ❌ = no schedule)", 
                             members_list, 
@@ -669,8 +798,39 @@ pub async fn handle_match_command(
     // Create a formatted response with just the first match
     let first_match_message = format_match_option(&active_poll, 0, required_yes_count);
     
+    // Get role mentions for all groups
+    let mut role_mentions = Vec::new();
+    for group_name in &group_names {
+        // Query to get the role ID for this group
+        let role_query = sqlx::query(
+            "SELECT role_id FROM discord_groups WHERE name = $1 AND server_id = $2"
+        )
+        .bind(group_name)
+        .bind(server_id.clone())
+        .fetch_optional(&ctx.db_pool)
+        .await;
+        
+        if let Ok(Some(row)) = role_query {
+            if let Ok(role_id) = row.try_get::<Option<String>, _>("role_id") {
+                if let Some(id) = role_id {
+                    role_mentions.push(format!("<@&{}>", id));
+                }
+            }
+        }
+    }
+    
+    let role_ping = if !role_mentions.is_empty() {
+        format!("🗣️ {} A meeting time has been proposed! Please vote!", role_mentions.join(" "))
+    } else {
+        String::new()
+    };
+    
     // Edit the original response with the first match
     let message = command.edit_original_interaction_response(&ctx.ctx.http, |m| {
+        if !role_ping.is_empty() {
+            m.content(&role_ping);
+        }
+        
         m.embed(|e| {
             e.title(format!("Proposed Meeting Time (1 of {})", match_response.matches.len()))
                 .description(&first_match_message)
@@ -781,17 +941,50 @@ async fn handle_match_vote(
             )
         };
         
-        // Collect attendees for the ping message
+        // Collect attendees and role IDs for the ping message
         let attendees: Vec<String> = poll.responses.iter()
             .filter(|&(_, is_attending)| *is_attending)
             .map(|(user_id, _)| format!("<@{}>", user_id))
             .collect();
+        
+        // Gather role IDs for all groups involved
+        let mut role_ids = Vec::new();
+        for group_name in &poll.group_names {
+            // Query to get the role ID for this group
+            let role_query = sqlx::query(
+                "SELECT role_id FROM discord_groups WHERE name = $1 AND server_id = $2"
+            )
+            .bind(group_name)
+            .bind(component.guild_id.unwrap().to_string())
+            .fetch_optional(&ctx.db_pool)
+            .await;
             
-        // Create ping message for attendees
-        let ping_message = if !attendees.is_empty() {
-            format!("🔔 Meeting attendees: {} - Please mark your calendars!", attendees.join(" "))
-        } else {
-            "No confirmed attendees yet.".to_string()
+            if let Ok(Some(row)) = role_query {
+                if let Ok(role_id) = row.try_get::<Option<String>, _>("role_id") {
+                    if let Some(id) = role_id {
+                        role_ids.push(format!("<@&{}>", id));
+                    }
+                }
+            }
+        }
+            
+        // Create ping message for attendees and roles
+        let ping_message = {
+            let mut message = "🔔 Meeting confirmed! ".to_string();
+            
+            // Add role pings
+            if !role_ids.is_empty() {
+                message.push_str(&format!("{} ", role_ids.join(" ")));
+            }
+            
+            // Add individual attendee pings
+            if !attendees.is_empty() {
+                message.push_str("- Please mark your calendars!");
+            } else {
+                message.push_str("Please mark your calendars!");
+            }
+            
+            message
         };
         
         let mut description = format!(
@@ -836,7 +1029,38 @@ async fn handle_match_vote(
         // Update the message to show the updated vote count
         let match_message = format_match_option(poll, poll.current_index, poll.required_yes_count);
         
+        // Gather role IDs for all groups to ping during voting
+        let mut role_mentions = Vec::new();
+        for group_name in &poll.group_names {
+            // Query to get the role ID for this group
+            let role_query = sqlx::query(
+                "SELECT role_id FROM discord_groups WHERE name = $1 AND server_id = $2"
+            )
+            .bind(group_name)
+            .bind(component.guild_id.unwrap().to_string())
+            .fetch_optional(&ctx.db_pool)
+            .await;
+            
+            if let Ok(Some(row)) = role_query {
+                if let Ok(role_id) = row.try_get::<Option<String>, _>("role_id") {
+                    if let Some(id) = role_id {
+                        role_mentions.push(format!("<@&{}>", id));
+                    }
+                }
+            }
+        }
+        
+        let role_ping = if !role_mentions.is_empty() {
+            format!("🗣️ {} Please vote on this meeting time proposal!", role_mentions.join(" "))
+        } else {
+            String::new()
+        };
+        
         component.message.edit(&ctx.ctx.http, |m| {
+            if !role_ping.is_empty() {
+                m.content(&role_ping);
+            }
+            
             m.embed(|e| {
                 e.title(format!("Proposed Meeting Time ({} of {})", 
                                poll.current_index + 1, 

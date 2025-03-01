@@ -1,6 +1,6 @@
 use serenity::builder::CreateApplicationCommands;
 use serenity::framework::standard::macros::{command, group};
-use serenity::framework::standard::{CommandResult, StandardFramework};
+use serenity::framework::standard::CommandResult;
 use serenity::model::prelude::*;
 use serenity::prelude::*;
 

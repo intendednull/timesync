@@ -34,6 +34,7 @@ pub struct DbDiscordGroup {
     pub id: Uuid,
     pub name: String,
     pub server_id: String,
+    pub role_id: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 

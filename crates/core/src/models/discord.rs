@@ -32,6 +32,7 @@ pub struct DiscordGroup {
     pub id: Uuid,
     pub name: String,
     pub server_id: String,
+    pub role_id: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -47,6 +48,7 @@ pub struct CreateDiscordGroupResponse {
     pub id: Uuid,
     pub name: String,
     pub server_id: String,
+    pub role_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,6 +56,7 @@ pub struct GetDiscordGroupResponse {
     pub id: Uuid,
     pub name: String,
     pub server_id: String,
+    pub role_id: Option<String>,
     pub members: Vec<DiscordGroupMember>,
 }
 
@@ -73,6 +76,18 @@ pub struct UpdateDiscordGroupRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateDiscordGroupResponse {
     pub id: Uuid,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateDiscordGroupRoleRequest {
+    pub role_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateDiscordGroupRoleResponse {
+    pub id: Uuid,
+    pub role_id: String,
     pub updated_at: DateTime<Utc>,
 }
 

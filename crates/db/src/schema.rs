@@ -19,6 +19,35 @@ pub async fn initialize_database(pool: &Pool<Postgres>) -> Result<()> {
     .execute(pool)
     .await?;
     
+    // Check if role_id column exists in discord_groups table
+    info!("Checking for role_id column in discord_groups table...");
+    let role_id_exists = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT EXISTS (
+            SELECT 1 
+            FROM information_schema.columns 
+            WHERE table_name = 'discord_groups' AND column_name = 'role_id'
+        );
+        "#,
+    )
+    .fetch_one(pool)
+    .await?;
+    
+    if !role_id_exists {
+        info!("Adding role_id column to discord_groups table...");
+        sqlx::query(
+            r#"
+            ALTER TABLE discord_groups
+            ADD COLUMN role_id VARCHAR(255) NULL;
+            "#,
+        )
+        .execute(pool)
+        .await?;
+        info!("role_id column added successfully.");
+    } else {
+        info!("role_id column already exists.");
+    }
+    
     // Add timezone column to schedules table if it doesn't exist
     info!("Checking for timezone column in schedules table...");
     let column_exists = sqlx::query_scalar::<_, bool>(
@@ -113,6 +142,7 @@ pub async fn initialize_database(pool: &Pool<Postgres>) -> Result<()> {
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             name VARCHAR(255) NOT NULL,
             server_id VARCHAR(255) NOT NULL,
+            role_id VARCHAR(255),
             created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
         );
         "#,

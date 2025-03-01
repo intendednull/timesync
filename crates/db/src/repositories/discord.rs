@@ -55,20 +55,22 @@ pub async fn create_discord_group(
     pool: &Pool<Postgres>,
     name: &str,
     server_id: &str,
+    role_id: Option<&str>,
 ) -> Result<DbDiscordGroup> {
     let id = Uuid::new_v4();
     let now = Utc::now();
 
     let discord_group = sqlx::query_as::<_, DbDiscordGroup>(
         r#"
-        INSERT INTO discord_groups (id, name, server_id, created_at)
-        VALUES ($1, $2, $3, $4)
-        RETURNING id, name, server_id, created_at
+        INSERT INTO discord_groups (id, name, server_id, role_id, created_at)
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING id, name, server_id, role_id, created_at
         "#,
     )
     .bind(id)
     .bind(name)
     .bind(server_id)
+    .bind(role_id)
     .bind(now)
     .fetch_one(pool)
     .await?;
@@ -82,7 +84,7 @@ pub async fn get_discord_group_by_id(
 ) -> Result<Option<DbDiscordGroup>> {
     let discord_group = sqlx::query_as::<_, DbDiscordGroup>(
         r#"
-        SELECT id, name, server_id, created_at
+        SELECT id, name, server_id, role_id, created_at
         FROM discord_groups
         WHERE id = $1
         "#,
@@ -98,6 +100,7 @@ pub async fn update_discord_group(
     pool: &Pool<Postgres>,
     id: Uuid,
     name: Option<&str>,
+    role_id: Option<&str>,
 ) -> Result<DbDiscordGroup> {
     let group = get_discord_group_by_id(pool, id)
         .await?
@@ -108,13 +111,14 @@ pub async fn update_discord_group(
     let updated_group = sqlx::query_as::<_, DbDiscordGroup>(
         r#"
         UPDATE discord_groups
-        SET name = $2
+        SET name = $2, role_id = $3
         WHERE id = $1
-        RETURNING id, name, server_id, created_at
+        RETURNING id, name, server_id, role_id, created_at
         "#,
     )
     .bind(id)
     .bind(name)
+    .bind(role_id.or_else(|| group.role_id.as_deref()))
     .fetch_one(pool)
     .await?;
 
@@ -187,7 +191,7 @@ pub async fn get_user_groups(
 ) -> Result<Vec<DbDiscordGroup>> {
     let groups = sqlx::query_as::<_, DbDiscordGroup>(
         r#"
-        SELECT g.id, g.name, g.server_id, g.created_at
+        SELECT g.id, g.name, g.server_id, g.role_id, g.created_at
         FROM discord_groups g
         JOIN group_members gm ON g.id = gm.group_id
         WHERE gm.discord_id = $1
@@ -198,4 +202,25 @@ pub async fn get_user_groups(
     .await?;
 
     Ok(groups)
+}
+
+pub async fn update_group_role_id(
+    pool: &Pool<Postgres>,
+    id: Uuid,
+    role_id: &str,
+) -> Result<DbDiscordGroup> {
+    let updated_group = sqlx::query_as::<_, DbDiscordGroup>(
+        r#"
+        UPDATE discord_groups
+        SET role_id = $2
+        WHERE id = $1
+        RETURNING id, name, server_id, role_id, created_at
+        "#,
+    )
+    .bind(id)
+    .bind(role_id)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(updated_group)
 }

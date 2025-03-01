@@ -28,4 +28,8 @@ pub fn routes() -> Router<Arc<ApiState>> {
             "/discord/groups/:id",
             put(handlers::discord::update_discord_group),
         )
+        .route(
+            "/discord/groups/:id/role",
+            put(handlers::discord::update_discord_group_role),
+        )
 }
