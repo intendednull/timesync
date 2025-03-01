@@ -1,0 +1,44 @@
+# Git
+.git
+.gitignore
+
+# Rust build artifacts
+target/
+**/*.rs.bk
+Cargo.lock
+
+# Docker files
+.dockerignore
+Dockerfile
+Dockerfile.discord
+docker-compose.yml
+
+# Environment variables
+.env
+.env.*
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Documentation
+README.md
+LICENSE
+docs/
+
+# Backup files
+**/*~
+**/*.bak
+
+# Temp files
+.tmp/
+.temp/
+
+# Logs
+logs/
+*.log
+
+# Testing
+*.test

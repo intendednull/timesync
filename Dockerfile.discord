@@ -1,0 +1,41 @@
+FROM rust:1.75-slim-bookworm as builder
+
+WORKDIR /usr/src/app
+COPY . .
+
+# Install dependencies for building
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    pkg-config \
+    libssl-dev \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install cargo-watch for development
+RUN cargo install cargo-watch
+
+# Build the release binaries
+RUN cargo build --release --bin discord-bot
+
+# Runtime stage
+FROM debian:bookworm-slim
+
+WORKDIR /app
+
+# Install runtime dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy binary from builder stage
+COPY --from=builder /usr/src/app/target/release/discord-bot /app/discord-bot
+
+# Create a non-root user to run the application
+RUN useradd -m appuser
+RUN chown -R appuser:appuser /app
+USER appuser
+
+# Default command runs the Discord bot
+CMD ["/app/discord-bot"]

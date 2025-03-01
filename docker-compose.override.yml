@@ -1,0 +1,59 @@
+version: '3.8'
+
+# Development overrides for docker-compose.yml
+services:
+  # Development database with exposed ports
+  postgres:
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_dev_data:/var/lib/postgresql/data
+
+  # API service with mounted source code for development
+  api:
+    build:
+      target: builder
+    command: cargo watch -x run
+    volumes:
+      - .:/usr/src/app
+      - cargo_registry:/usr/local/cargo/registry
+      - cargo_cache:/usr/local/cargo/cache
+    environment:
+      RUST_BACKTRACE: 1
+      DEVELOPMENT_MODE: true
+      LOG_LEVEL: debug
+
+  # Discord bot with mounted source code for development
+  discord-bot:
+    build:
+      target: builder
+    command: cargo watch -x "run --bin discord-bot"
+    volumes:
+      - .:/usr/src/app
+      - cargo_registry:/usr/local/cargo/registry
+      - cargo_cache:/usr/local/cargo/cache
+    environment:
+      RUST_BACKTRACE: 1
+      DEVELOPMENT_MODE: true
+      LOG_LEVEL: debug
+
+  # Add pgAdmin for database management in development
+  pgadmin:
+    image: dpage/pgadmin4
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL:-admin@example.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD:-admin}
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+    ports:
+      - "5050:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
+volumes:
+  postgres_dev_data:
+  cargo_registry:
+  cargo_cache:
+  pgadmin_data:

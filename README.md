@@ -63,6 +63,17 @@ The project is organized as a Rust workspace with multiple crates:
 - Lint: `cargo clippy`
 - Format: `cargo fmt`
 
+### Docker Setup
+
+For Docker-based development and deployment:
+
+```bash
+# Start all services using Docker
+docker-compose up -d
+```
+
+See [Docker Setup](docs/DOCKER.md) for detailed instructions.
+
 ## API Documentation
 
 The TimeSync API provides endpoints for:
