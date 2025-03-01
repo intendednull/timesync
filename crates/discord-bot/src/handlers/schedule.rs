@@ -2,12 +2,17 @@ use chrono::Utc;
 use eyre::Result;
 use serenity::{
     model::{
-        application::interaction::{application_command::ApplicationCommandInteraction, InteractionResponseType}, 
+        application::interaction::{
+            application_command::ApplicationCommandInteraction, 
+            message_component::MessageComponentInteraction,
+            InteractionResponseType
+        }, 
         application::interaction::application_command::CommandDataOption,
     },
     utils::Color,
 };
 use timesync_core::models::discord::CreateDiscordGroupRequest;
+use std::collections::HashMap;
 
 use crate::handlers::HandlerContext;
 
@@ -594,61 +599,370 @@ pub async fn handle_match_command(
         return Ok(());
     }
     
-    // Create a formatted response
-    let mut description = format!(
-        "Found {} possible meeting {} for groups: {}\n\n",
-        match_response.matches.len(),
-        if match_response.matches.len() == 1 { "time" } else { "times" },
-        group_names.join(", ")
-    );
+    // Calculate the total number of unique users in all groups
+    let first_match = &match_response.matches[0];
+    let mut unique_user_ids = std::collections::HashSet::new();
     
-    for (i, m) in match_response.matches.iter().enumerate() {
-        let start_time = m.start.format("%a, %b %d at %H:%M");
-        let end_time = m.end.format("%H:%M");
-        
-        description.push_str(&format!(
-            "**Option {}:** {} - {} UTC\n",
-            i + 1,
-            start_time,
-            end_time
-        ));
-        
-        for group in &m.groups {
-            description.push_str(&format!(
-                "• **{}**: {} {} available\n",
-                group.name,
-                group.count,
-                if group.count == 1 { "member" } else { "members" }
-            ));
+    for group in &first_match.groups {
+        for user_id in &group.available_users {
+            unique_user_ids.insert(user_id);
         }
-        
-        description.push('\n');
     }
+    let total_unique_users = unique_user_ids.len();
     
-    // Edit the original response
-    command.edit_original_interaction_response(&ctx.ctx.http, |m| {
+    // Determine how many users need to say yes for the time to be confirmed
+    // Using a simple majority (over 50%)
+    let required_yes_count = (total_unique_users as f64 * 0.5).ceil() as usize;
+    
+    // Create initial poll with first match
+    let active_poll = super::ActivePoll {
+        matches: match_response.matches.clone(),
+        current_index: 0,
+        group_names: group_names.clone(),
+        min_per_group,
+        required_yes_count,
+        responses: HashMap::new(),
+    };
+    
+    // Create a formatted response with just the first match
+    let first_match_message = format_match_option(&active_poll, 0, required_yes_count);
+    
+    // Edit the original response with the first match
+    let message = command.edit_original_interaction_response(&ctx.ctx.http, |m| {
         m.embed(|e| {
-            e.title("Available Meeting Times")
-                .description(description)
-                .color(Color::DARK_GREEN)
+            e.title(format!("Proposed Meeting Time (1 of {})", match_response.matches.len()))
+                .description(&first_match_message)
+                .color(Color::GOLD)
                 .footer(|f| f.text(format!(
-                    "Min members per group: {} • Generated at: {}",
+                    "Min members per group: {} • {}/{} yes votes needed • Generated at: {}",
                     min_per_group,
+                    0,
+                    required_yes_count,
                     Utc::now().format("%Y-%m-%d %H:%M UTC")
                 )))
         })
         .components(|c| {
             c.create_action_row(|row| {
                 row.create_button(|b| {
-                    b.custom_id("match_confirm")
-                        .label("Confirm Meeting")
+                    b.custom_id("match_yes")
+                        .label("Yes")
                         .style(serenity::model::application::component::ButtonStyle::Success)
+                })
+                .create_button(|b| {
+                    b.custom_id("match_no")
+                        .label("No")
+                        .style(serenity::model::application::component::ButtonStyle::Danger)
+                })
+            })
+            .create_action_row(|row| {
+                if active_poll.matches.len() > 1 {
+                    row.create_button(|b| {
+                        b.custom_id("match_next")
+                            .label("Next Option")
+                            .style(serenity::model::application::component::ButtonStyle::Secondary)
+                    })
+                } else {
+                    row
+                }
+            })
+        })
+    }).await?;
+    
+    // Store the poll state
+    {
+        let mut polls = ctx.active_polls.write().await;
+        polls.insert(message.id, active_poll);
+    }
+    
+    Ok(())
+}
+
+/// Handle button interactions for scheduling matches
+pub async fn handle_component_interaction(
+    ctx: HandlerContext,
+    component: &mut MessageComponentInteraction
+) -> Result<()> {
+    let custom_id = &component.data.custom_id;
+    
+    match custom_id.as_str() {
+        "match_yes" | "match_no" => handle_match_vote(ctx, component, custom_id == "match_yes").await,
+        "match_next" => handle_match_next(ctx, component).await,
+        "match_confirm" => handle_match_confirm(ctx, component).await,
+        _ => Ok(()),
+    }
+}
+
+/// Handle voting interactions (Yes/No)
+async fn handle_match_vote(
+    ctx: HandlerContext,
+    component: &mut MessageComponentInteraction,
+    is_yes: bool,
+) -> Result<()> {
+    // Acknowledge the interaction
+    component.create_interaction_response(&ctx.ctx.http, |r| {
+        r.kind(InteractionResponseType::DeferredUpdateMessage)
+    }).await?;
+
+    // Get the poll associated with this message
+    let mut polls = ctx.active_polls.write().await;
+    let poll = polls.get_mut(&component.message.id)
+        .ok_or_else(|| eyre::eyre!("No active poll found for this message"))?;
+    
+    // Record the user's response
+    let user_id = component.user.id.to_string();
+    poll.responses.insert(user_id, is_yes);
+    
+    // Count yes votes
+    let yes_votes = poll.responses.values().filter(|&&v| v).count();
+    
+    // Check if we have enough yes votes
+    if yes_votes >= poll.required_yes_count {
+        // Enough people agreed to this time, confirm it
+        let match_result = &poll.matches[poll.current_index];
+        
+        // Format confirmed time
+        let start_time = match_result.start.format("%a, %b %d at %H:%M");
+        let end_time = match_result.end.format("%H:%M");
+        
+        let mut description = format!(
+            "The meeting time has been confirmed!\n\n**{}** - **{}** UTC\n\n",
+            start_time, end_time
+        );
+        
+        description.push_str("**Attending:**\n");
+        for (user_id, response) in &poll.responses {
+            if *response {
+                description.push_str(&format!("• <@{}> ✅\n", user_id));
+            }
+        }
+        
+        description.push_str("\n**Not Available:**\n");
+        for (user_id, response) in &poll.responses {
+            if !response {
+                description.push_str(&format!("• <@{}> ❌\n", user_id));
+            }
+        }
+        
+        // Update the message to show the confirmation
+        component.message.edit(&ctx.ctx.http, |m| {
+            m.embed(|e| {
+                e.title("Meeting Time Confirmed!")
+                    .description(description)
+                    .color(Color::DARK_GREEN)
+                    .footer(|f| f.text(format!(
+                        "Min members per group: {} • {}/{} yes votes received",
+                        poll.min_per_group,
+                        yes_votes,
+                        poll.required_yes_count
+                    )))
+            })
+            .components(|c| c) // Clear components
+        }).await?;
+        
+        // Remove the poll from active polls
+        polls.remove(&component.message.id);
+    } else {
+        // Update the message to show the updated vote count
+        let match_message = format_match_option(poll, poll.current_index, poll.required_yes_count);
+        
+        component.message.edit(&ctx.ctx.http, |m| {
+            m.embed(|e| {
+                e.title(format!("Proposed Meeting Time ({} of {})", 
+                               poll.current_index + 1, 
+                               poll.matches.len()))
+                    .description(&match_message)
+                    .color(Color::GOLD)
+                    .footer(|f| f.text(format!(
+                        "Min members per group: {} • {}/{} yes votes needed • Generated at: {}",
+                        poll.min_per_group,
+                        yes_votes,
+                        poll.required_yes_count,
+                        Utc::now().format("%Y-%m-%d %H:%M UTC")
+                    )))
+            })
+            .components(|c| {
+                c.create_action_row(|row| {
+                    row.create_button(|b| {
+                        b.custom_id("match_yes")
+                            .label("Yes")
+                            .style(serenity::model::application::component::ButtonStyle::Success)
+                    })
+                    .create_button(|b| {
+                        b.custom_id("match_no")
+                            .label("No")
+                            .style(serenity::model::application::component::ButtonStyle::Danger)
+                    })
+                })
+                .create_action_row(|row| {
+                    if poll.matches.len() > 1 {
+                        row.create_button(|b| {
+                            b.custom_id("match_next")
+                                .label("Next Option")
+                                .style(serenity::model::application::component::ButtonStyle::Secondary)
+                        })
+                    } else {
+                        row
+                    }
+                })
+            })
+        }).await?;
+    }
+    
+    Ok(())
+}
+
+/// Handle the "Next Option" button to cycle through matches
+async fn handle_match_next(
+    ctx: HandlerContext,
+    component: &mut MessageComponentInteraction,
+) -> Result<()> {
+    // Acknowledge the interaction
+    component.create_interaction_response(&ctx.ctx.http, |r| {
+        r.kind(InteractionResponseType::DeferredUpdateMessage)
+    }).await?;
+
+    // Get the poll associated with this message
+    let mut polls = ctx.active_polls.write().await;
+    let poll = polls.get_mut(&component.message.id)
+        .ok_or_else(|| eyre::eyre!("No active poll found for this message"))?;
+    
+    // Move to the next match option, or wrap around to the first
+    poll.current_index = (poll.current_index + 1) % poll.matches.len();
+    
+    // Count yes votes
+    let yes_votes = poll.responses.values().filter(|&&v| v).count();
+    
+    // Update the message to show the next option
+    let match_message = format_match_option(poll, poll.current_index, poll.required_yes_count);
+    
+    component.message.edit(&ctx.ctx.http, |m| {
+        m.embed(|e| {
+            e.title(format!("Proposed Meeting Time ({} of {})", 
+                           poll.current_index + 1, 
+                           poll.matches.len()))
+                .description(&match_message)
+                .color(Color::GOLD)
+                .footer(|f| f.text(format!(
+                    "Min members per group: {} • {}/{} yes votes needed • Generated at: {}",
+                    poll.min_per_group,
+                    yes_votes,
+                    poll.required_yes_count,
+                    Utc::now().format("%Y-%m-%d %H:%M UTC")
+                )))
+        })
+        .components(|c| {
+            c.create_action_row(|row| {
+                row.create_button(|b| {
+                    b.custom_id("match_yes")
+                        .label("Yes")
+                        .style(serenity::model::application::component::ButtonStyle::Success)
+                })
+                .create_button(|b| {
+                    b.custom_id("match_no")
+                        .label("No")
+                        .style(serenity::model::application::component::ButtonStyle::Danger)
+                })
+            })
+            .create_action_row(|row| {
+                row.create_button(|b| {
+                    b.custom_id("match_next")
+                        .label("Next Option")
+                        .style(serenity::model::application::component::ButtonStyle::Secondary)
                 })
             })
         })
     }).await?;
     
     Ok(())
+}
+
+/// Handle the "Confirm Meeting" button (legacy implementation)
+async fn handle_match_confirm(
+    ctx: HandlerContext,
+    component: &mut MessageComponentInteraction,
+) -> Result<()> {
+    // This is the "old" confirm button, which should not be used anymore
+    // However, we keep this for backward compatibility
+    component.create_interaction_response(&ctx.ctx.http, |r| {
+        r.kind(InteractionResponseType::ChannelMessageWithSource)
+            .interaction_response_data(|m| {
+                m.content("This feature has been updated. Please use the new /match command to propose meeting times.")
+                    .ephemeral(true)
+            })
+    }).await?;
+    
+    Ok(())
+}
+
+/// Format a single match option for display
+fn format_match_option(poll: &super::ActivePoll, index: usize, required_yes: usize) -> String {
+    let match_result = &poll.matches[index];
+    
+    // Format the time
+    let start_time = match_result.start.format("%a, %b %d at %H:%M");
+    let end_time = match_result.end.format("%H:%M");
+    
+    let mut description = format!(
+        "**Proposed Time:** {} - {} UTC\n\n",
+        start_time, end_time
+    );
+    
+    // Add group information
+    description.push_str("**Available Members:**\n");
+    for group in &match_result.groups {
+        description.push_str(&format!(
+            "• **{}**: {} {}\n",
+            group.name,
+            group.count,
+            if group.count == 1 { "member" } else { "members" }
+        ));
+        
+        // List the available users for each group
+        if !group.available_users.is_empty() {
+            for user_id in &group.available_users {
+                description.push_str(&format!("  - <@{}>\n", user_id));
+            }
+        }
+    }
+    
+    // Add responses if there are any
+    let yes_count = poll.responses.iter().filter(|&(_, v)| *v).count();
+    let yes_users: Vec<&String> = poll.responses.iter()
+        .filter(|&(_, v)| *v)
+        .map(|(user_id, _)| user_id)
+        .collect();
+    
+    let no_users: Vec<&String> = poll.responses.iter()
+        .filter(|&(_, v)| !(*v))
+        .map(|(user_id, _)| user_id)
+        .collect();
+    
+    if !yes_users.is_empty() || !no_users.is_empty() {
+        description.push_str("\n**Current Responses:**\n");
+        
+        if !yes_users.is_empty() {
+            description.push_str("✅ **Yes:**\n");
+            for user_id in &yes_users {
+                description.push_str(&format!("• <@{}>\n", user_id));
+            }
+        }
+        
+        if !no_users.is_empty() {
+            description.push_str("❌ **No:**\n");
+            for user_id in &no_users {
+                description.push_str(&format!("• <@{}>\n", user_id));
+            }
+        }
+    }
+    
+    // Add progress indicator
+    description.push_str(&format!(
+        "\n{}/{} yes votes needed to confirm this time",
+        yes_count,
+        required_yes
+    ));
+    
+    description
 }
 
 /// Extract a string option from a command
