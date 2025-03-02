@@ -1,4 +1,4 @@
-use chrono::{Utc, Offset, Datelike};
+use chrono::{Utc, Offset, Datelike, Timelike};
 use eyre::Result;
 use serenity::{
     model::{
@@ -983,11 +983,20 @@ fn organize_slots_by_day(
             let start_local = current_time.with_timezone(&tz);
             let end_local = chunk_end.with_timezone(&tz);
             
-            let formatted_time = format!(
-                "{}-{}", 
-                start_local.format("%I:%M%p"), 
-                end_local.format("%I:%M%p")
-            ).replace("AM", "am").replace("PM", "pm");
+            // Format using shorthand - no minutes if on the hour
+            let formatted_time = if start_local.minute() == 0 && end_local.minute() == 0 {
+                format!(
+                    "{}-{}", 
+                    start_local.format("%-I%p"), 
+                    end_local.format("%-I%p")
+                )
+            } else {
+                format!(
+                    "{}-{}", 
+                    start_local.format("%-I:%M%p"), 
+                    end_local.format("%-I:%M%p")
+                )
+            }.to_lowercase().replace(" ", "");
             
             // Create a unique ID for this slot
             let slot_id = format!("{}_{}", match_idx, current_time.timestamp());
