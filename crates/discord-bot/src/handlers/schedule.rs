@@ -892,7 +892,7 @@ pub async fn handle_match_command(
                         for slot in chunk {
                             row.create_button(|b| {
                                 b.custom_id(format!("slot_{}", slot.id))
-                                    .label(&slot.formatted_time)
+                                    .label(format!("{} (0)", &slot.formatted_time)) // Start with zero votes
                                     .style(serenity::model::application::component::ButtonStyle::Secondary)
                             });
                         }
@@ -1094,29 +1094,10 @@ fn format_time_slots(poll: &super::ActivePoll) -> String {
         total_eligible
     ));
     
-    // Count votes for each time slot on current day
-    let mut slot_vote_counts = HashMap::new();
-    for (_user_id, selected_slots) in &poll.slot_responses {
-        for slot_id in selected_slots {
-            *slot_vote_counts.entry(slot_id).or_insert(0) += 1;
-        }
-    }
-    
-    // Display available time slots with vote counts
-    message.push_str("**Available Time Slots:**\n");
-    for slot in current_day_slots {
-        let votes = slot_vote_counts.get(&slot.id).cloned().unwrap_or(0);
-        
-        message.push_str(&format!(
-            "• **{}** - {} people have voted for this slot\n",
-            slot.formatted_time,
-            votes
-        ));
-    }
-    message.push_str("\n");
+    // Time slots are now shown directly in the buttons
     
     // Add instructions
-    message.push_str("Click on a time to toggle your availability. Green buttons indicate times you've selected.\n");
+    message.push_str("Click on a time to toggle your availability. Green buttons indicate times you've selected. The number in parentheses (0) shows how many people have selected that time.\n");
     message.push_str("Use the navigation buttons to switch between days.\n");
     message.push_str("When you're done, click 'Submit Votes' to lock in your selections. If you don't select any times, you'll be marked as unavailable.\n\n");
     
@@ -2134,9 +2115,14 @@ async fn update_time_slot_message(
                             // Check if this slot is selected by the current user
                             let is_selected = user_selected_slots.contains(&slot.id);
                             
+                            // Count votes for this slot
+                            let vote_count = poll.slot_responses.values()
+                                .filter(|selected_slots| selected_slots.contains(&slot.id))
+                                .count();
+                                
                             row.create_button(|b| {
                                 b.custom_id(format!("slot_{}", slot.id))
-                                    .label(&slot.formatted_time)
+                                    .label(format!("{} ({})", &slot.formatted_time, vote_count))
                                     .style(if is_selected {
                                         serenity::model::application::component::ButtonStyle::Success // Green for selected
                                     } else {
