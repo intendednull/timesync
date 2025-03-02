@@ -1,4 +1,4 @@
-use chrono::{Utc, Offset};
+use chrono::{Utc, Offset, Datelike};
 use eyre::Result;
 use serenity::{
     model::{
@@ -11,7 +11,7 @@ use serenity::{
     },
     utils::Color,
 };
-use timesync_core::models::discord::{CreateDiscordGroupRequest, CreateDiscordGroupResponse};
+use timesync_core::models::discord::{CreateDiscordGroupRequest, CreateDiscordGroupResponse, MatchResult};
 use std::collections::HashMap;
 use std::str::FromStr;
 use sqlx::Row;
@@ -965,7 +965,7 @@ fn organize_slots_by_day(
     for (match_idx, match_result) in matches.iter().enumerate() {
         // Convert to local timezone for display
         let start_local = match_result.start.with_timezone(&tz);
-        let end_local = match_result.end.with_timezone(&tz);
+        let _end_local = match_result.end.with_timezone(&tz);
         
         // Calculate day index (days since epoch for the start date)
         let day_idx = start_local.date_naive().num_days_from_ce() as usize;
@@ -1069,14 +1069,13 @@ fn format_time_slots(poll: &super::ActivePoll) -> String {
     
     message
 }
-}
 
 /// Handle button interactions for scheduling matches
 pub async fn handle_component_interaction(
     ctx: HandlerContext,
     component: &mut MessageComponentInteraction
 ) -> Result<()> {
-    let custom_id = &component.data.custom_id;
+    let custom_id = component.data.custom_id.clone();
     
     match custom_id.as_str() {
         // Legacy handlers
@@ -1743,7 +1742,7 @@ async fn handle_finish_voting(
     // Calculate the optimal meeting time based on votes
     let optimal_slot = find_optimal_meeting_slot(poll);
     
-    if let Some((day_idx, slot_info, attending_users)) = optimal_slot {
+    if let Some((_day_idx, slot_info, attending_users)) = optimal_slot {
         // We found a good meeting time
         // Format date for display
         let tz = chrono_tz::Tz::from_str(&poll.timezone).unwrap_or(chrono_tz::UTC);
@@ -1986,7 +1985,6 @@ fn find_optimal_meeting_slot(poll: &super::ActivePoll) -> Option<(usize, super::
     }
     
     best_slot
-}
 }
 
 /// Format a single match option for display

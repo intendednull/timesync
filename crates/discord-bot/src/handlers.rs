@@ -207,6 +207,7 @@ pub struct ActivePoll {
 ///
 /// This struct provides a convenient way to pass the Discord context,
 /// bot configuration, and database connection to command handlers.
+#[derive(Clone)]
 pub struct HandlerContext {
     pub ctx: Context,
     pub config: BotConfig,
