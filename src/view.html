@@ -17,6 +17,7 @@
             <div class="schedule-header">
                 <h2 id="schedule-name">Loading schedule...</h2>
                 <div class="schedule-actions">
+                    <!-- Edit button hidden but preserved in DOM for potential future use -->
                     <button id="edit-schedule" class="secondary-button" style="display: none;">Edit Schedule</button>
                     <button id="share-schedule" class="secondary-button">Share Schedule</button>
                 </div>
@@ -32,7 +33,14 @@
                     </div>
                 </div>
                 
-                <div class="time-controls">
+                <!-- Changing to show weekly days, not specific dates -->
+                <div class="time-header" id="weekly-header">
+                    <h3>Weekly Schedule Pattern</h3>
+                    <p>Times that repeat every week</p>
+                </div>
+                
+                <!-- Navigation buttons hidden but preserved in DOM -->
+                <div class="time-controls" style="display: none;">
                     <button type="button" id="prev-week">Previous Week</button>
                     <span id="current-date-range">Current Week</span>
                     <button type="button" id="next-week">Next Week</button>
@@ -64,7 +72,7 @@
             </div>
             
             <div class="form-actions">
-                <a href="/" class="button secondary-button">Create New Schedule</a>
+                <a href="/" class="button" style="background-color: var(--primary-color); color: white; padding: 12px 24px; font-size: 18px; border-radius: 4px;">Create New Schedule</a>
             </div>
         </main>
         

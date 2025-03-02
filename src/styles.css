@@ -118,6 +118,14 @@ small {
     border: 1px solid var(--border-color);
 }
 
+.schedule-mode-info {
+    flex: 1;
+    padding: 15px;
+    background-color: var(--bg-elevated);
+    border-radius: 8px;
+    border: 1px solid var(--primary-color);
+}
+
 /* Timezone selector */
 .timezone-selector {
     padding: 15px;

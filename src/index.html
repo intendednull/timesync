@@ -20,7 +20,8 @@
                     <input type="text" id="schedule-name" name="name" required placeholder="Enter a name for your schedule">
                 </div>
                 
-                <div class="form-group">
+                <!-- Password field hidden but preserved in the DOM for potential future use -->
+                <div class="form-group" style="display: none;">
                     <label for="schedule-password">Password (optional)</label>
                     <input type="password" id="schedule-password" name="password" placeholder="Add a password to edit later">
                     <small>Leave blank for a read-only schedule</small>
@@ -35,14 +36,20 @@
                     <h2>Select Your Available Times</h2>
                     
                     <div class="form-row">
-                        <div class="schedule-mode-toggle">
+                        <!-- Weekly toggle hidden but preserved in the DOM for potential future use -->
+                        <div class="schedule-mode-toggle" style="display: none;">
                             <label class="toggle-label">
                                 <input type="checkbox" id="recurring-toggle">
                                 <span class="toggle-text">Weekly recurring schedule</span>
                             </label>
                             <p class="toggle-description">
-                                <small id="schedule-mode-description">Currently selecting specific dates. Toggle to set a weekly recurring pattern instead.</small>
+                                <small id="schedule-mode-description">Setting a weekly recurring pattern. All selected times will repeat weekly.</small>
                             </p>
+                        </div>
+                        
+                        <div class="schedule-mode-info">
+                            <p><strong>Weekly Recurring Schedule</strong></p>
+                            <p><small>All selected times will repeat every week</small></p>
                         </div>
                         
                         <div class="timezone-selector">
@@ -53,13 +60,14 @@
                         </div>
                     </div>
                     
-                    <div class="time-controls">
+                    <!-- Date navigation controls hidden but preserved for potential future use -->
+                    <div class="time-controls" style="display: none;">
                         <button type="button" id="prev-week">Previous Week</button>
                         <span id="current-date-range">Current Week</span>
                         <button type="button" id="next-week">Next Week</button>
                     </div>
                     
-                    <div class="time-header" id="weekly-header" style="display: none;">
+                    <div class="time-header" id="weekly-header">
                         <h3>Weekly Schedule Pattern</h3>
                         <p>Choose times that will repeat every week</p>
                     </div>

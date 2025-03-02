@@ -3,7 +3,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const selectedTimeSlots = new Set();
     let isMouseDown = false;
     let isSelecting = true; // true = selecting, false = deselecting
-    let isRecurringMode = true; // Toggle between specific dates and recurring weekly pattern - default to weekly
+    let isRecurringMode = true; // Always set to true - weekly recurring is the only supported mode now
     let currentTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone; // Default to local timezone
     
     // Box selection state variables
@@ -46,73 +46,77 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }, 10); // Small delay to ensure DOM is fully ready
     
-    // Event listeners for week navigation
-    document.getElementById('prev-week').addEventListener('click', () => {
-        if (!isRecurringMode) {
-            currentWeekStart.setDate(currentWeekStart.getDate() - 7);
-            initializeTimeGrid();
-            updateDateRange();
-        }
-    });
+    // Event listeners for week navigation (preserved for potential future use)
+    const prevWeekButton = document.getElementById('prev-week');
+    if (prevWeekButton) {
+        prevWeekButton.addEventListener('click', () => {
+            if (!isRecurringMode) {
+                currentWeekStart.setDate(currentWeekStart.getDate() - 7);
+                initializeTimeGrid();
+                updateDateRange();
+            }
+        });
+    }
     
-    document.getElementById('next-week').addEventListener('click', () => {
-        if (!isRecurringMode) {
-            currentWeekStart.setDate(currentWeekStart.getDate() + 7);
-            initializeTimeGrid();
-            updateDateRange();
-        }
-    });
+    const nextWeekButton = document.getElementById('next-week');
+    if (nextWeekButton) {
+        nextWeekButton.addEventListener('click', () => {
+            if (!isRecurringMode) {
+                currentWeekStart.setDate(currentWeekStart.getDate() + 7);
+                initializeTimeGrid();
+                updateDateRange();
+            }
+        });
+    }
     
-    // Recurring schedule toggle
+    // Set up references to UI elements (preserved for potential future use)
     const recurringToggle = document.getElementById('recurring-toggle');
     const scheduleDescription = document.getElementById('schedule-mode-description');
-    const prevWeekBtn = document.getElementById('prev-week');
-    const nextWeekBtn = document.getElementById('next-week');
     const dateRangeText = document.getElementById('current-date-range');
     const timeControlsDiv = document.querySelector('.time-controls');
     const weeklyHeaderDiv = document.getElementById('weekly-header');
     
-    // Set the initial toggle state to reflect our default recurring mode
-    recurringToggle.checked = isRecurringMode;
-    
-    // Update initial UI based on our default recurring mode
-    if (isRecurringMode) {
-        // Weekly view is default
-        scheduleDescription.textContent = 'Setting a weekly recurring pattern. All selected times will repeat weekly.';
-        // Hide date controls and show weekly header
-        timeControlsDiv.style.display = 'none';
-        weeklyHeaderDiv.style.display = 'block';
-    } else {
-        scheduleDescription.textContent = 'Currently selecting specific dates. Toggle to set a weekly recurring pattern instead.';
-        timeControlsDiv.style.display = 'flex';
-        weeklyHeaderDiv.style.display = 'none';
+    // Always set the toggle to checked to enforce weekly recurring mode
+    if (recurringToggle) {
+        recurringToggle.checked = true;
     }
     
-    recurringToggle.addEventListener('change', () => {
-        isRecurringMode = recurringToggle.checked;
-        
-        if (isRecurringMode) {
-            // Switch to weekly view
-            scheduleDescription.textContent = 'Setting a weekly recurring pattern. All selected times will repeat weekly.';
-            // Hide date controls and show weekly header
-            timeControlsDiv.style.display = 'none';
-            weeklyHeaderDiv.style.display = 'block';
+    // Always show weekly header since we only support recurring weekly schedules
+    if (weeklyHeaderDiv) {
+        weeklyHeaderDiv.style.display = 'block';
+    }
+    
+    // The toggle event listener is preserved for potential future use but not active in UI
+    if (recurringToggle) {
+        recurringToggle.addEventListener('change', () => {
+            // Functionality preserved but inactive in the UI
+            // Always reset to true as we only support weekly scheduling
+            isRecurringMode = true;
+            recurringToggle.checked = true;
             
-            // Reset to current week to make it clear what days user is setting
+            // Show weekly header
+            if (weeklyHeaderDiv) {
+                weeklyHeaderDiv.style.display = 'block';
+            }
+            
+            // Hide date controls
+            if (timeControlsDiv) {
+                timeControlsDiv.style.display = 'none';
+            }
+            
+            // Update description
+            if (scheduleDescription) {
+                scheduleDescription.textContent = 'Setting a weekly recurring pattern. All selected times will repeat weekly.';
+            }
+            
+            // Reset to current week
             currentWeekStart = getStartOfWeek(new Date());
-        } else {
-            // Switch to specific dates
-            scheduleDescription.textContent = 'Currently selecting specific dates. Toggle to set a weekly recurring pattern instead.';
-            // Show date controls and hide weekly header
-            timeControlsDiv.style.display = 'flex';
-            weeklyHeaderDiv.style.display = 'none';
-            updateDateRange();
-        }
-        
-        // Clear selections and reinitialize grid
-        selectedTimeSlots.clear();
-        initializeTimeGrid();
-    });
+            
+            // Clear selections and reinitialize grid
+            selectedTimeSlots.clear();
+            initializeTimeGrid();
+        });
+    }
     
     // Timezone selector change handler
     document.getElementById('timezone-select').addEventListener('change', (event) => {
@@ -429,7 +433,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         
         const name = document.getElementById('schedule-name').value;
-        const password = document.getElementById('schedule-password').value;
+        const password = ''; // Password functionality is disabled
         const discordId = document.getElementById('discord-id').value;
         const submitButton = document.getElementById('create-schedule');
         

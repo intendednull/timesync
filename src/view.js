@@ -16,18 +16,24 @@ document.addEventListener('DOMContentLoaded', () => {
     loadSchedule();
     updateDateRange();
     
-    // Event listeners for week navigation
-    document.getElementById('prev-week').addEventListener('click', () => {
-        currentWeekStart.setDate(currentWeekStart.getDate() - 7);
-        renderTimeGrid();
-        updateDateRange();
-    });
+    // Event listeners for week navigation (preserved for potential future use)
+    const prevWeekButton = document.getElementById('prev-week');
+    if (prevWeekButton) {
+        prevWeekButton.addEventListener('click', () => {
+            currentWeekStart.setDate(currentWeekStart.getDate() - 7);
+            renderTimeGrid();
+            updateDateRange();
+        });
+    }
     
-    document.getElementById('next-week').addEventListener('click', () => {
-        currentWeekStart.setDate(currentWeekStart.getDate() + 7);
-        renderTimeGrid();
-        updateDateRange();
-    });
+    const nextWeekButton = document.getElementById('next-week');
+    if (nextWeekButton) {
+        nextWeekButton.addEventListener('click', () => {
+            currentWeekStart.setDate(currentWeekStart.getDate() + 7);
+            renderTimeGrid();
+            updateDateRange();
+        });
+    }
     
     // Share button
     document.getElementById('share-schedule').addEventListener('click', () => {
@@ -52,14 +58,18 @@ document.addEventListener('DOMContentLoaded', () => {
         document.getElementById('share-modal').style.display = 'none';
     });
     
-    // Edit schedule button
-    document.getElementById('edit-schedule').addEventListener('click', () => {
-        if (isPasswordProtected && !isEditable) {
-            document.getElementById('password-modal').style.display = 'flex';
-        } else {
-            window.location.href = `/${scheduleId}/edit`;
-        }
-    });
+    // Edit schedule button (preserved for potential future use)
+    const editButton = document.getElementById('edit-schedule');
+    if (editButton) {
+        editButton.addEventListener('click', () => {
+            // Editing functionality is disabled, but code is preserved
+            if (isPasswordProtected && !isEditable) {
+                document.getElementById('password-modal').style.display = 'flex';
+            } else {
+                window.location.href = `/${scheduleId}/edit`;
+            }
+        });
+    }
     
     // Cancel password button
     document.getElementById('cancel-password').addEventListener('click', () => {
@@ -212,10 +222,13 @@ document.addEventListener('DOMContentLoaded', () => {
                 isEditable = true;
             }
             
-            // Show edit button if editable or password protected
+            // Edit functionality disabled - button always remains hidden
+            // Code preserved for potential future use
+            /*
             if (isEditable || isPasswordProtected) {
                 document.getElementById('edit-schedule').style.display = 'block';
             }
+            */
             
             // Render the time grid with the schedule data
             renderTimeGrid();
@@ -266,9 +279,9 @@ document.addEventListener('DOMContentLoaded', () => {
             day.setDate(day.getDate() + i);
             
             const dayHeader = document.createElement('div');
-            dayHeader.classList.add('grid-header');
-            dayHeader.textContent = day.toLocaleDateString('en-US', { weekday: 'short' }) + 
-                                   ' ' + day.getDate();
+            dayHeader.classList.add('grid-header', 'recurring-header');
+            // Show only day names without dates for weekly recurring schedule
+            dayHeader.textContent = day.toLocaleDateString('en-US', { weekday: 'short' });
             timeGrid.appendChild(dayHeader);
         }
         
