@@ -3,6 +3,21 @@
 //! This module contains handlers for working with user availability and matching
 //! optimal meeting times. It includes functionality for finding overlapping
 //! availability across multiple Discord groups.
+//!
+//! ## Availability Matching Algorithm
+//!
+//! The core algorithm in this module finds optimal meeting times where multiple groups
+//! of users can meet simultaneously. It works by:
+//!
+//! 1. Collecting all unique time slots from all users' schedules
+//! 2. For each time slot, checking how many users from each group are available
+//! 3. Keeping only time slots where at least a minimum number of users from each group are available
+//! 4. Ranking and returning the top matches based on specified criteria
+//!
+//! The algorithm is optimized to minimize database queries by:
+//! - Caching all time slots by schedule ID to avoid duplicate queries
+//! - Performing efficient set operations for availability calculations
+//! - Early filtering of time slots that cannot possibly match all criteria
 
 use axum::{
     extract::{Query, State},
@@ -54,11 +69,37 @@ pub struct MatchQuery {
 ///
 /// # Algorithm
 ///
-/// The matching algorithm:
-/// 1. Collects all unique time slots from all users
-/// 2. For each time slot, checks how many users from each group are available
-/// 3. Includes slots where at least `min_per_group` users from each group are available
-/// 4. Returns the top `count` matches sorted by start time
+/// The matching algorithm follows these steps:
+/// 
+/// 1. Input Validation & Preparation:
+///    - Validate group IDs and convert to UUIDs
+///    - Set default parameters (min_per_group=1, count=5)
+///    - Retrieve all group information from database
+///
+/// 2. Data Collection:
+///    - Collect all users from each group
+///    - Get schedule IDs for each user
+///    - Fetch all time slots for each schedule (with caching)
+/// 
+/// 3. Time Slot Collection & De-duplication:
+///    - Collect all unique time slots from all users' schedules
+///    - Sort by start time and remove duplicates
+/// 
+/// 4. Availability Analysis:
+///    - For each time slot:
+///      - For each group:
+///        - Count users whose availability contains the time slot
+///        - Include group if it meets minimum user requirement
+///      - Include time slot if all groups meet requirements
+/// 
+/// 5. Result Preparation:
+///    - Sort matches by start time
+///    - Limit to requested count
+///    - Format and return response
+///
+/// # Time Complexity:
+/// - O(U × S) where U is the number of users and S is the average number of slots per user
+/// - Space complexity is O(S_total) where S_total is the total number of unique time slots
 ///
 /// # Parameters
 ///
@@ -80,11 +121,15 @@ pub async fn match_availability(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<MatchQuery>,
 ) -> Result<Json<MatchResponse>, AppError> {
+    // STEP 1: Input Validation & Preparation
+    
     // Parse comma-separated group IDs into UUIDs
     let group_ids: Result<Vec<Uuid>, _> = query
         .group_ids
         .split(',')
-        .map(|id| id.parse())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(Uuid::parse_str)
         .collect();
 
     // Return validation error if any group ID is invalid
@@ -103,6 +148,8 @@ pub async fn match_availability(
     let min_per_group = query.min_per_group.unwrap_or(1);
     let count = query.count.unwrap_or(5);
 
+    // STEP 2: Data Collection
+    
     // Retrieve and validate all groups
     let mut groups = HashMap::new();
     for group_id in &group_ids {
@@ -158,26 +205,52 @@ pub async fn match_availability(
         }
     }
 
-    // Match availability across groups
-    // This is a simplified algorithm that could be enhanced in future versions
-    let mut matches = Vec::new();
+    // STEP 3: Time Slot Collection & De-duplication
     
-    // Collect all unique time slots from all users
-    let mut all_time_slots = Vec::new();
+    // Extract all unique time slot boundaries
+    let mut time_boundaries = Vec::new();
     for slots in schedule_time_slots.values() {
         for slot in slots {
-            all_time_slots.push((slot.start_time, slot.end_time));
+            time_boundaries.push(slot.start_time);
+            time_boundaries.push(slot.end_time);
         }
     }
-
-    // Sort and deduplicate time slots
-    all_time_slots.sort_by(|a, b| a.0.cmp(&b.0));
-    all_time_slots.dedup();
-
-    // Check each time slot against each group
-    for (start, end) in all_time_slots.iter().take(count) {
+    
+    // Sort and deduplicate time boundaries
+    time_boundaries.sort();
+    time_boundaries.dedup();
+    
+    // If we have fewer than 2 time boundaries, no valid time slots exist
+    if time_boundaries.len() < 2 {
+        return Ok(Json(MatchResponse { matches: Vec::new() }));
+    }
+    
+    // Create potential time slots from adjacent boundaries
+    let mut potential_time_slots = Vec::new();
+    for window in time_boundaries.windows(2) {
+        let start = window[0];
+        let end = window[1];
+        
+        // Only consider non-zero duration slots
+        if start < end {
+            potential_time_slots.push((start, end));
+        }
+    }
+    
+    // STEP 4: Availability Analysis
+    
+    // Find matching time slots
+    let mut matches = Vec::new();
+    
+    for (start, end) in potential_time_slots {
+        // Skip if this slot is zero duration or invalid
+        if start >= end {
+            continue;
+        }
+        
+        let mut all_groups_match = true;
         let mut match_groups = Vec::new();
-
+        
         // For each group, find users available during this time slot
         for &group_id in &group_ids {
             let schedules = group_schedules.get(&group_id).unwrap();
@@ -190,8 +263,9 @@ pub async fn match_availability(
                 let slots = schedule_time_slots.get(schedule_id).unwrap();
                 
                 // User is available if any of their slots contain this time period
+                // A time slot contains another if: slot.start <= target.start && slot.end >= target.end
                 let is_available = slots.iter().any(|slot| {
-                    slot.start_time <= *start && slot.end_time >= *end
+                    slot.start_time <= start && slot.end_time >= end
                 });
                 
                 if is_available {
@@ -199,7 +273,7 @@ pub async fn match_availability(
                 }
             }
             
-            // Only include group if it meets minimum requirement
+            // Check if this group meets the minimum requirement
             if available_users.len() >= min_per_group {
                 let count = available_users.len();
                 match_groups.push(MatchGroupResult {
@@ -208,20 +282,35 @@ pub async fn match_availability(
                     available_users,
                     count,
                 });
+            } else {
+                // If any group doesn't have enough users, this time slot is invalid
+                all_groups_match = false;
+                break;
             }
         }
         
         // Only include match if all groups have at least min_per_group users available
-        if match_groups.len() == group_ids.len() {
+        if all_groups_match {
             matches.push(MatchResult {
-                start: *start,
-                end: *end,
+                start,
+                end,
                 groups: match_groups,
             });
         }
     }
-
+    
+    // STEP 5: Result Preparation
+    
+    // Sort matches by start time
+    matches.sort_by(|a, b| a.start.cmp(&b.start));
+    
+    // Limit to requested count
+    if matches.len() > count {
+        matches.truncate(count);
+    }
+    
     // Build and return response
     let response = MatchResponse { matches };
     Ok(Json(response))
 }
+
