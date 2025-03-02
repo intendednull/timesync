@@ -30,10 +30,16 @@ use uuid::Uuid;
 ///
 /// # Example
 ///
-/// ```rust
-/// let password = "user_password";
-/// let hashed = hash_password(password)?;
-/// // Store hashed in the database
+/// ```
+/// use eyre::Result;
+/// use timesync_api::middleware::auth::hash_password;
+/// 
+/// fn example() -> Result<()> {
+///     let password = "user_password";
+///     let hashed = hash_password(password)?;
+///     // Store hashed in the database
+///     Ok(())
+/// }
 /// ```
 ///
 /// # Security Notes
@@ -75,15 +81,27 @@ pub fn hash_password(password: &str) -> Result<String> {
 ///
 /// # Example
 ///
-/// ```rust
-/// let schedule_id = Uuid::parse_str("a1b2c3d4-e5f6-7890-abcd-ef1234567890")?;
-/// let is_valid = verify_schedule_password(&pool, schedule_id, "user_provided_password").await?;
+/// ```
+/// use eyre::Result;
+/// use uuid::Uuid;
+/// use sqlx::PgPool;
+/// use timesync_api::middleware::auth::verify_schedule_password;
 /// 
-/// if is_valid {
-///     // Allow access to the schedule
-/// } else {
-///     // Deny access
+/// async fn example() -> Result<()> {
+///     # let pool = PgPool::connect("postgres://postgres:password@localhost/test").await?;
+///     let schedule_id = Uuid::parse_str("a1b2c3d4-e5f6-7890-abcd-ef1234567890")?;
+///     let is_valid = verify_schedule_password(&pool, schedule_id, "user_provided_password").await?;
+///     
+///     if is_valid {
+///         // Allow access to the schedule
+///     } else {
+///         // Deny access
+///     }
+///     Ok(())
 /// }
+/// # 
+/// # // This enables doctests to compile but not run the example
+/// # fn main() {}
 /// ```
 ///
 /// # Security Notes

@@ -755,7 +755,7 @@ pub async fn handle_match_command(
     
     // Set the required "Yes" votes (6 per group or all members if less than 6)
     let mut required_yes_count = 0;
-    for (_, members) in &group_members {
+    for members in group_members.values() {
         required_yes_count += std::cmp::min(6, members.len());
     }
     
@@ -785,10 +785,7 @@ pub async fn handle_match_command(
             .await;
             
             match result {
-                Ok(Some(row)) => match row.try_get::<String, _>("timezone") {
-                    Ok(tz) => Some(tz),
-                    Err(_) => None
-                },
+                Ok(Some(row)) => row.try_get::<String, _>("timezone").ok(),
                 _ => None
             }
             .unwrap_or_else(|| "UTC".to_string())
@@ -830,10 +827,8 @@ pub async fn handle_match_command(
         .await;
         
         if let Ok(Some(row)) = role_query {
-            if let Ok(role_id) = row.try_get::<Option<String>, _>("role_id") {
-                if let Some(id) = role_id {
-                    role_mentions.push(format!("<@&{}>", id));
-                }
+            if let Ok(Some(id)) = row.try_get::<Option<String>, _>("role_id") {
+                role_mentions.push(format!("<@&{}>", id));
             }
         }
     }
@@ -947,7 +942,7 @@ async fn handle_match_vote(
     let mut group_yes_votes = HashMap::new();
     for (group_id, members) in &poll.group_members {
         let group_yes = members.iter()
-            .filter(|&member_id| poll.responses.get(member_id).map_or(false, |&vote| vote))
+            .filter(|&member_id| poll.responses.get(member_id).is_some_and(|&vote| vote))
             .count();
         group_yes_votes.insert(*group_id, group_yes);
     }
@@ -966,8 +961,8 @@ async fn handle_match_vote(
     
     // Count total yes and no votes for UI display
     let yes_votes = poll.responses.values().filter(|&&v| v).count();
-    let no_votes = poll.responses.values().filter(|&&v| !v).count();
-    let total_voters = eligible_voters.len();
+    let _no_votes = poll.responses.values().filter(|&&v| !v).count();
+    let _total_voters = eligible_voters.len();
     
     // Check if we have reached the minimum threshold for yes votes from each group
     if all_groups_have_enough {
@@ -1012,10 +1007,8 @@ async fn handle_match_vote(
             .await;
             
             if let Ok(Some(row)) = role_query {
-                if let Ok(role_id) = row.try_get::<Option<String>, _>("role_id") {
-                    if let Some(id) = role_id {
-                        role_ids.push(format!("<@&{}>", id));
-                    }
+                if let Ok(Some(id)) = row.try_get::<Option<String>, _>("role_id") {
+                    role_ids.push(format!("<@&{}>", id));
                 }
             }
         }
@@ -1081,10 +1074,10 @@ async fn handle_match_vote(
         // Check if it's impossible to get enough yes votes for any group
         let mut impossible_to_get_enough = false;
         
-        for (group_id, members) in &poll.group_members {
+        for members in poll.group_members.values() {
             let required_for_group = std::cmp::min(6, members.len());
             let current_yes = members.iter()
-                .filter(|&member_id| poll.responses.get(member_id).map_or(false, |&vote| vote))
+                .filter(|&member_id| poll.responses.get(member_id).is_some_and(|&vote| vote))
                 .count();
             
             let remaining_votes = members.iter()
@@ -1126,10 +1119,8 @@ async fn handle_match_vote(
                     .await;
                     
                     if let Ok(Some(row)) = role_query {
-                        if let Ok(role_id) = row.try_get::<Option<String>, _>("role_id") {
-                            if let Some(id) = role_id {
-                                role_mentions.push(format!("<@&{}>", id));
-                            }
+                        if let Ok(Some(id)) = row.try_get::<Option<String>, _>("role_id") {
+                            role_mentions.push(format!("<@&{}>", id));
                         }
                     }
                 }
@@ -1206,10 +1197,8 @@ async fn handle_match_vote(
                 .await;
                 
                 if let Ok(Some(row)) = role_query {
-                    if let Ok(role_id) = row.try_get::<Option<String>, _>("role_id") {
-                        if let Some(id) = role_id {
-                            role_mentions.push(format!("<@&{}>", id));
-                        }
+                    if let Ok(Some(id)) = row.try_get::<Option<String>, _>("role_id") {
+                        role_mentions.push(format!("<@&{}>", id));
                     }
                 }
             }
@@ -1279,7 +1268,7 @@ async fn handle_match_confirm(
 }
 
 /// Format a single match option for display
-fn format_match_option(poll: &super::ActivePoll, index: usize, required_yes: usize) -> String {
+fn format_match_option(poll: &super::ActivePoll, index: usize, _required_yes: usize) -> String {
     let match_result = &poll.matches[index];
     
     // Format the time using the poll's timezone if possible
@@ -1319,7 +1308,7 @@ fn format_match_option(poll: &super::ActivePoll, index: usize, required_yes: usi
         
         // Count yes votes for this group
         let group_yes_votes = group.available_users.iter()
-            .filter(|&user_id| poll.responses.get(user_id).map_or(false, |&vote| vote))
+            .filter(|&user_id| poll.responses.get(user_id).is_some_and(|&vote| vote))
             .count();
         
         description.push_str(&format!(
@@ -1383,7 +1372,7 @@ fn format_match_option(poll: &super::ActivePoll, index: usize, required_yes: usi
         if let Some(members) = poll.group_members.get(&group_id) {
             let required_for_group = std::cmp::min(6, members.len());
             let group_yes_votes = members.iter()
-                .filter(|&user_id| poll.responses.get(user_id).map_or(false, |&vote| vote))
+                .filter(|&user_id| poll.responses.get(user_id).is_some_and(|&vote| vote))
                 .count();
             
             vote_requirements.push_str(&format!(
@@ -1569,10 +1558,7 @@ async fn handle_timezone_show(
         .await?;
         
         match result {
-            Some(row) => match row.try_get::<String, _>("timezone") {
-                Ok(tz) => Some(tz),
-                Err(_) => None
-            },
+            Some(row) => row.try_get::<String, _>("timezone").ok(),
             None => None
         }
     } else {
@@ -1658,7 +1644,7 @@ async fn handle_timezone_list(
         for zone in zones {
             description.push_str(&format!("• `{}`\n", zone));
         }
-        description.push_str("\n");
+        description.push('\n');
     }
     
     description.push_str("\nUse `/timezone set <timezone>` to set your server's timezone. For a complete list of available timezones, see the [IANA Time Zone Database](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones).");

@@ -24,7 +24,7 @@ async fn ping(ctx: &Context, msg: &Message) -> CommandResult {
 /// # Arguments
 ///
 /// * `commands` - A mutable reference to a CreateApplicationCommands object
-///                that will be modified to include our custom commands.
+///   that will be modified to include our custom commands.
 ///
 /// # Returns
 ///

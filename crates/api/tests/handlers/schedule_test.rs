@@ -28,11 +28,13 @@ async fn test_get_schedule_wrapper(
             name: schedule.name,
             created_at: schedule.created_at,
             is_editable: schedule.password_hash.is_some(),
+            timezone: schedule.timezone.clone(),
             slots: time_slots
                 .into_iter()
                 .map(|slot| timesync_core::models::schedule::TimeSlotResponse {
                     start: slot.start_time,
                     end: slot.end_time,
+                    is_recurring: slot.is_recurring,
                 })
                 .collect(),
         };
@@ -103,11 +105,13 @@ async fn test_update_schedule_wrapper(
         name: updated_schedule.name,
         created_at: updated_schedule.created_at,
         is_editable: updated_schedule.password_hash.is_some(),
+        timezone: updated_schedule.timezone.clone(),
         slots: time_slots
             .into_iter()
             .map(|slot| timesync_core::models::schedule::TimeSlotResponse {
                 start: slot.start_time,
                 end: slot.end_time,
+                is_recurring: slot.is_recurring,
             })
             .collect(),
     }))
@@ -148,6 +152,7 @@ async fn test_create_schedule_success() {
             Ok(DbSchedule {
                 id: schedule_id,
                 name: name.to_string(),
+                timezone: "UTC".to_string(),
                 password_hash: None,
                 created_at: now,
             })
@@ -173,6 +178,7 @@ async fn test_create_schedule_success() {
         password: None,
         slots: vec![],
         discord_id: None,
+        timezone: "UTC".to_string(),
     };
     
     // The mocks are set up with expectations, and since we're not calling the real DB,
@@ -185,6 +191,7 @@ async fn test_create_schedule_success() {
         name: name.clone(),
         password_hash: None,
         created_at: now,
+        timezone: "UTC".to_string(),
     };
     
     // Then we'd get a successful response
@@ -193,6 +200,7 @@ async fn test_create_schedule_success() {
         name,
         created_at: now,
         is_editable: false,
+        timezone: "UTC".to_string(),
     };
     
     // Assert the expected values match what we'd expect from the handler
@@ -216,10 +224,12 @@ async fn test_create_schedule_with_slots() {
     let _request = CreateScheduleRequest {
         name: "Test Schedule".to_string(),
         password: None,
+        timezone: "UTC".to_string(),
         slots: vec![
             CreateTimeSlotRequest {
                 start: start_time,
                 end: end_time,
+                is_recurring: false,
             }
         ],
         discord_id: None,
@@ -233,6 +243,7 @@ async fn test_create_schedule_with_slots() {
         name: "Test Schedule".to_string(),
         created_at: now,
         is_editable: false,
+        timezone: "UTC".to_string(),
     };
     
     // Assert basic expectations would be met
@@ -252,6 +263,7 @@ async fn test_create_schedule_with_discord_user() {
     let _request = CreateScheduleRequest {
         name: "Test Schedule".to_string(),
         password: None,
+        timezone: "UTC".to_string(),
         slots: vec![],
         discord_id: Some(discord_id),
     };
@@ -263,6 +275,7 @@ async fn test_create_schedule_with_discord_user() {
         name: "Test Schedule".to_string(),
         created_at: now,
         is_editable: false,
+        timezone: "UTC".to_string(),
     };
     
     // Assert the expected values are what we'd expect
@@ -319,6 +332,7 @@ async fn test_update_schedule_success() {
                 id,
                 name: "Test Schedule".to_string(),
                 password_hash: None,
+                timezone: "UTC".to_string(),
                 created_at: now,
             }))
         });
@@ -333,6 +347,7 @@ async fn test_update_schedule_success() {
                 id,
                 name: name.unwrap_or("Test Schedule").to_string(),
                 password_hash: None,
+                timezone: "UTC".to_string(),
                 created_at: now,
             })
         });
@@ -357,6 +372,7 @@ async fn test_update_schedule_success() {
                 start_time: start,
                 end_time: end,
                 created_at: now,
+                is_recurring: false,
             })
         });
     
@@ -370,6 +386,7 @@ async fn test_update_schedule_success() {
                     schedule_id: id,
                     start_time: now,
                     end_time: now + chrono::Duration::hours(1),
+                    is_recurring: false,
                     created_at: now,
                 }
             ])
@@ -380,9 +397,11 @@ async fn test_update_schedule_success() {
     let end_time = now + chrono::Duration::hours(1);
     let request = UpdateScheduleRequest {
         name: Some("Updated Schedule".to_string()),
+        timezone: Some("UTC".to_string()),
         slots: vec![CreateTimeSlotRequest {
             start: start_time,
             end: end_time,
+            is_recurring: false,
         }],
         password: None,
     };
@@ -411,6 +430,7 @@ async fn test_update_schedule_with_password() {
                 id,
                 name: "Test Schedule".to_string(),
                 password_hash: Some("hashed_password".to_string()),
+                timezone: "UTC".to_string(),
                 created_at: now,
             }))
         });
@@ -430,6 +450,7 @@ async fn test_update_schedule_with_password() {
                 id,
                 name: name.unwrap_or("Test Schedule").to_string(),
                 password_hash: Some("hashed_password".to_string()),
+                timezone: "UTC".to_string(),
                 created_at: now,
             })
         });
@@ -444,6 +465,7 @@ async fn test_update_schedule_with_password() {
     // Create the request payload with password
     let request = UpdateScheduleRequest {
         name: Some("Updated Schedule".to_string()),
+        timezone: Some("UTC".to_string()),
         slots: vec![],
         password: Some("password123".to_string()),
     };
@@ -471,6 +493,7 @@ async fn test_update_schedule_invalid_password() {
                 id,
                 name: "Test Schedule".to_string(),
                 password_hash: Some("hashed_password".to_string()),
+                timezone: "UTC".to_string(),
                 created_at: now,
             }))
         });
@@ -486,6 +509,7 @@ async fn test_update_schedule_invalid_password() {
     // Create the request payload with wrong password
     let request = UpdateScheduleRequest {
         name: Some("Updated Schedule".to_string()),
+        timezone: Some("UTC".to_string()),
         slots: vec![],
         password: Some("wrong_password".to_string()),
     };

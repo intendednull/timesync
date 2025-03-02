@@ -24,14 +24,34 @@ use timesync_core::errors::TimeError;
 ///
 /// # Example
 ///
-/// ```rust
-/// async fn handler() -> Result<Json<ScheduleResponse>, AppError> {
+/// ```
+/// use axum::Json;
+/// use timesync_api::middleware::error_handling::AppError;
+/// use timesync_core::errors::TimeError;
+/// use uuid::Uuid;
+/// 
+/// // Type definition to make the example compile
+/// struct ScheduleResponse {}
+/// struct Repository {
+///     // Mock implementation
+/// }
+/// 
+/// impl Repository {
+///     async fn get_schedule(&self, _id: Uuid) -> Result<ScheduleResponse, String> {
+///         // Mock implementation
+///         Ok(ScheduleResponse {})
+///     }
+/// }
+/// 
+/// async fn handler(id: Uuid) -> Result<Json<ScheduleResponse>, AppError> {
+///     let repository = Repository {};
 ///     let schedule = repository.get_schedule(id)
 ///         .await
 ///         .map_err(|e| AppError(TimeError::NotFound(e.to_string())))?;
 ///     
-///     Ok(Json(schedule.into()))
+///     Ok(Json(schedule))
 /// }
+/// # fn main() {}
 /// ```
 #[derive(Debug)]
 pub struct AppError(pub TimeError);
@@ -97,9 +117,28 @@ impl From<eyre::Report> for AppError {
 ///
 /// # Example
 ///
-/// ```rust
-/// async fn legacy_handler() -> impl IntoResponse {
-///     match repository.get_schedule(id).await {
+/// ```ignore
+/// use axum::{http::StatusCode, response::IntoResponse, Json};
+/// use timesync_api::middleware::error_handling::map_error;
+/// use timesync_core::errors::TimeError;
+/// use uuid::Uuid;
+/// 
+/// // Type definition to make the example compile
+/// struct Schedule {}
+/// struct Repository {}
+/// 
+/// impl Repository {
+///     async fn get_schedule(&self, _id: Uuid) -> Result<Schedule, String> {
+///         // Mock implementation
+///         Ok(Schedule {})
+///     }
+/// }
+/// 
+/// async fn legacy_handler(id: Uuid) -> impl IntoResponse {
+///     let repository = Repository {};
+///     let result = repository.get_schedule(id).await;
+///     
+///     match result {
 ///         Ok(schedule) => (StatusCode::OK, Json(schedule)),
 ///         Err(err) => map_error(TimeError::NotFound(err.to_string())),
 ///     }

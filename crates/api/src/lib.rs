@@ -44,9 +44,19 @@ use tracing_subscriber::FmtSubscriber;
 ///
 /// # Example
 ///
-/// ```rust
-/// let state = Arc::new(ApiState { db_pool });
-/// let app = Router::new().with_state(state);
+/// ```no_run
+/// use std::sync::Arc;
+/// use axum::Router;
+/// use sqlx::PgPool;
+/// use timesync_api::ApiState;
+/// 
+/// # async fn example() {
+/// #     let db_pool = PgPool::connect("postgres://postgres:password@localhost/test").await.unwrap();
+///     let state = Arc::new(ApiState { db_pool });
+///     let app: Router = Router::new().with_state(state);
+///     // Use app...
+/// # }
+/// # fn main() {}
 /// ```
 pub struct ApiState {
     /// PostgreSQL connection pool for database operations
@@ -69,10 +79,20 @@ pub struct ApiState {
 ///
 /// # Example
 ///
-/// ```rust
-/// let config = config::load_config()?;
-/// let db_pool = db::create_pool(&config.database_url).await?;
-/// start_server(config, db_pool).await?;
+/// ```
+/// use eyre::Result;
+/// use sqlx::PgPool;
+/// use timesync_api::{config, start_server};
+/// 
+/// async fn main_example() -> Result<()> {
+///     let config = config::ApiConfig::from_env()?;
+///     let db_pool = PgPool::connect(&config.database_url).await?;
+///     start_server(config, db_pool).await?;
+///     Ok(())
+/// }
+/// # 
+/// # // This enables doctests to compile but not run the example
+/// # fn main() {}
 /// ```
 pub async fn start_server(config: config::ApiConfig, db_pool: PgPool) -> Result<()> {
     // Initialize tracing for logging
@@ -100,7 +120,7 @@ pub async fn start_server(config: config::ApiConfig, db_pool: PgPool) -> Result<
             // If path contains "edit", serve edit.html
             Some(p) if p.0.contains("edit") => "src/edit.html",
             // If path is just a UUID, serve view.html
-            Some(p) if p.0.len() > 0 && !p.0.contains("/") => "src/view.html",
+            Some(p) if !p.0.is_empty() && !p.0.contains("/") => "src/view.html",
             // If path is "availability", serve availability.html
             Some(p) if p.0 == "availability" => "src/availability.html",
             // If path is "create", serve index.html (this is for discord integration)

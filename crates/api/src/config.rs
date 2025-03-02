@@ -26,9 +26,15 @@ use tracing::Level;
 ///
 /// # Example
 ///
-/// ```rust
-/// let config = ApiConfig::from_env()?;
-/// println!("Starting server on {}:{}", config.host, config.port);
+/// ```
+/// use eyre::Result;
+/// use timesync_api::config::ApiConfig;
+/// 
+/// fn example() -> Result<()> {
+///     let config = ApiConfig::from_env()?;
+///     println!("Starting server on {}:{}", config.host, config.port);
+///     Ok(())
+/// }
 /// ```
 #[derive(Debug, Clone)]
 pub struct ApiConfig {

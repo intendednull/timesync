@@ -436,10 +436,115 @@ async fn test_match_availability_comprehensive() {
     };
     
     // Reset the mocks before the next test
-    ctx = TestContext::new();
+    let mut ctx = TestContext::new();
     
-    // Set up the same mocks as before
-    // (Code omitted for brevity - in a real implementation, we would need to set up all mocks again)
+    // Set up the same mocks as before for the second test
+    // First set up discord group repository mock for both groups
+    let second_group1_id = group1_id;
+    let second_base_time = base_time;
+    
+    ctx.discord_group_repo.expect_get_discord_group_by_id()
+        .times(2)
+        .returning(move |id| {
+            let name = if id == second_group1_id { "Group 1" } else { "Group 2" };
+            Ok(Some(DbDiscordGroup {
+                id,
+                name: name.to_string(),
+                server_id: "server123".to_string(),
+                role_id: Some("role123".to_string()),
+                created_at: second_base_time,
+            }))
+        });
+    
+    // Set up mock for group members again - 3 users in group 1, 2 users in group 2
+    ctx.discord_group_repo.expect_get_group_members()
+        .times(2)
+        .returning(move |group_id| {
+            if group_id == second_group1_id {
+                Ok(vec![
+                    DbGroupMember { group_id, discord_id: "user1".to_string() },
+                    DbGroupMember { group_id, discord_id: "user2".to_string() },
+                    DbGroupMember { group_id, discord_id: "user3".to_string() },
+                ])
+            } else {
+                Ok(vec![
+                    DbGroupMember { group_id, discord_id: "user4".to_string() },
+                    DbGroupMember { group_id, discord_id: "user5".to_string() },
+                ])
+            }
+        });
+    
+    // We need to create new schedule IDs for the second test to avoid ownership issues
+    let second_schedule_ids: Vec<Uuid> = (1..=5).map(|_| Uuid::new_v4()).collect();
+    let second_schedule_ids_clone1 = second_schedule_ids.clone();
+    let second_schedule_ids_clone2 = second_schedule_ids.clone();
+    
+    ctx.discord_user_repo.expect_get_discord_user_by_id()
+        .times(5)
+        .returning(move |discord_id| {
+            let index = match discord_id {
+                "user1" => 0,
+                "user2" => 1,
+                "user3" => 2,
+                "user4" => 3,
+                "user5" => 4,
+                _ => return Ok(None),
+            };
+            
+            Ok(Some(DbDiscordUser {
+                discord_id: discord_id.to_string(),
+                schedule_id: Some(second_schedule_ids_clone1[index]),
+                created_at: second_base_time,
+            }))
+        });
+    
+    // Set up the time slot mocks again using the cloned schedule IDs
+    ctx.time_slot_repo.expect_get_time_slots_by_schedule_id()
+        .times(5)
+        .returning(move |schedule_id| {
+            // Same time periods as before
+            let p1_start = second_base_time;
+            let p1_end = p1_start + chrono::Duration::hours(1);
+            let p2_start = p1_end;
+            let p2_end = p2_start + chrono::Duration::hours(1);
+            let p3_start = p2_end;
+            let p3_end = p3_start + chrono::Duration::hours(1);
+            let p4_start = p3_end + chrono::Duration::hours(2);
+            let p4_end = p4_start + chrono::Duration::hours(1);
+            let p5_start = p4_end;
+            let p5_end = p5_start + chrono::Duration::hours(1);
+            
+            // Same slot assignments as before
+            let slots = if schedule_id == second_schedule_ids_clone2[0] {
+                vec![
+                    DbTimeSlot { id: Uuid::new_v4(), schedule_id, start_time: p1_start, end_time: p2_end, is_recurring: false, created_at: second_base_time },
+                    DbTimeSlot { id: Uuid::new_v4(), schedule_id, start_time: p4_start, end_time: p4_end, is_recurring: false, created_at: second_base_time },
+                ]
+            } else if schedule_id == second_schedule_ids_clone2[1] {
+                vec![
+                    DbTimeSlot { id: Uuid::new_v4(), schedule_id, start_time: p2_start, end_time: p3_end, is_recurring: false, created_at: second_base_time },
+                    DbTimeSlot { id: Uuid::new_v4(), schedule_id, start_time: p5_start, end_time: p5_end, is_recurring: false, created_at: second_base_time },
+                ]
+            } else if schedule_id == second_schedule_ids_clone2[2] {
+                vec![
+                    DbTimeSlot { id: Uuid::new_v4(), schedule_id, start_time: p1_start, end_time: p1_end, is_recurring: false, created_at: second_base_time },
+                    DbTimeSlot { id: Uuid::new_v4(), schedule_id, start_time: p3_start, end_time: p3_end, is_recurring: false, created_at: second_base_time },
+                    DbTimeSlot { id: Uuid::new_v4(), schedule_id, start_time: p4_start, end_time: p5_end, is_recurring: false, created_at: second_base_time },
+                ]
+            } else if schedule_id == second_schedule_ids_clone2[3] {
+                vec![
+                    DbTimeSlot { id: Uuid::new_v4(), schedule_id, start_time: p1_start, end_time: p3_end, is_recurring: false, created_at: second_base_time },
+                    DbTimeSlot { id: Uuid::new_v4(), schedule_id, start_time: p5_start, end_time: p5_end, is_recurring: false, created_at: second_base_time },
+                ]
+            } else {
+                vec![
+                    DbTimeSlot { id: Uuid::new_v4(), schedule_id, start_time: p2_start, end_time: p2_end, is_recurring: false, created_at: second_base_time },
+                    DbTimeSlot { id: Uuid::new_v4(), schedule_id, start_time: p4_start, end_time: p5_end, is_recurring: false, created_at: second_base_time },
+                ]
+            };
+            
+            Ok(slots)
+        });
     
     // This test should return an empty result, not an error
     let result_high_min = test_match_availability_wrapper(&mut ctx, query_high_min).await;

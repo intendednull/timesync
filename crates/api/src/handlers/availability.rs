@@ -63,7 +63,7 @@ pub struct MatchQuery {
 ///
 /// # Endpoint
 ///
-/// ```
+/// ```http
 /// GET /availability/match?group_ids=uuid1,uuid2&min_per_group=2&count=5
 /// ```
 ///

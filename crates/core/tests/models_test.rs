@@ -90,6 +90,7 @@ fn test_discord_group_serialization() {
         id,
         name: "Test Group".to_string(),
         server_id: "server123".to_string(),
+        role_id: None,
         created_at,
     };
     
@@ -112,6 +113,7 @@ fn test_discord_group_serialization() {
         CreateTimeSlotRequest {
             start: Utc::now(),
             end: Utc::now() + chrono::Duration::hours(1),
+            is_recurring: false,
         }
     ], 
     Some("discord123")
@@ -127,6 +129,7 @@ fn test_create_schedule_request(
         password: password.map(|p| p.to_string()),
         slots,
         discord_id: discord_id.map(|d| d.to_string()),
+        timezone: "UTC".to_string(),
     };
     
     let json = to_string(&request).expect("Failed to serialize create schedule request");
@@ -196,8 +199,10 @@ fn test_update_schedule_request() {
         slots: vec![CreateTimeSlotRequest {
             start: start_time,
             end: end_time,
+            is_recurring: false,
         }],
         password: Some("password123".to_string()),
+        timezone: Some("UTC".to_string()),
     };
     
     let json = to_string(&request).expect("Failed to serialize update schedule request");
@@ -228,6 +233,7 @@ fn test_time_slot_response() {
     let response = TimeSlotResponse {
         start: start_time,
         end: end_time,
+        is_recurring: false,
     };
     
     let json = to_string(&response).expect("Failed to serialize time slot response");
@@ -246,6 +252,7 @@ fn test_get_discord_group_response() {
         id,
         name: "Test Group".to_string(),
         server_id: "server123".to_string(),
+        role_id: None,
         members: vec![
             timesync_core::models::discord::DiscordGroupMember {
                 discord_id: "user1".to_string(),

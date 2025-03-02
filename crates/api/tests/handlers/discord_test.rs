@@ -83,6 +83,7 @@ async fn test_create_discord_user_success() {
                 name: "Test Schedule".to_string(),
                 password_hash: None,
                 created_at: now,
+                timezone: "UTC".to_string(),
             }))
         });
     
@@ -233,6 +234,7 @@ async fn test_create_discord_group_wrapper(
         id: group.id,
         name: group.name,
         server_id: group.server_id,
+        role_id: group.role_id.clone(),
         members: vec![], // Simplified for the test
     }))
 }
@@ -254,6 +256,7 @@ async fn test_create_discord_group_success() {
                 id: group_id,
                 name: name.to_string(),
                 server_id: server_id.to_string(),
+                role_id: None,
                 created_at: now,
             })
         });
@@ -349,6 +352,7 @@ async fn test_get_discord_group_wrapper(
         id: group.id,
         name: group.name,
         server_id: group.server_id,
+        role_id: group.role_id.clone(),
         members: member_details,
     }))
 }
@@ -368,6 +372,7 @@ async fn test_get_discord_group_success() {
                 id: group_id,
                 name: "Test Group".to_string(),
                 server_id: "server123".to_string(),
+                role_id: None,
                 created_at: now,
             }))
         });
@@ -477,6 +482,7 @@ async fn test_update_discord_group_wrapper(
         id: updated_group.id,
         name: updated_group.name,
         server_id: updated_group.server_id,
+        role_id: updated_group.role_id.clone(),
         members: vec![], // Simplified for the test
     }))
 }
@@ -495,6 +501,7 @@ async fn test_update_discord_group_success() {
                 id: group_id,
                 name: "Test Group".to_string(),
                 server_id: "server123".to_string(),
+                role_id: None,
                 created_at: now,
             }))
         });
@@ -510,6 +517,7 @@ async fn test_update_discord_group_success() {
                 id,
                 name: name.unwrap_or("Test Group").to_string(),
                 server_id: "server123".to_string(),
+                role_id: None,
                 created_at: now,
             })
         });

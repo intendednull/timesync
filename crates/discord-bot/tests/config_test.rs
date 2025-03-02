@@ -9,6 +9,7 @@ fn test_command_prefix_default() {
         web_base_url: "http://localhost".to_string(),
         database_url: "postgres://localhost".to_string(),
         command_prefix: None,
+        test_guild_id: None,
     };
     
     assert_eq!(config.command_prefix(), "!");
@@ -23,6 +24,7 @@ fn test_command_prefix_custom() {
         web_base_url: "http://localhost".to_string(),
         database_url: "postgres://localhost".to_string(),
         command_prefix: Some("/".to_string()),
+        test_guild_id: None,
     };
     
     assert_eq!(config.command_prefix(), "/");

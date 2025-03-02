@@ -118,7 +118,7 @@ pub async fn update_discord_group(
     )
     .bind(id)
     .bind(name)
-    .bind(role_id.or_else(|| group.role_id.as_deref()))
+    .bind(role_id.or(group.role_id.as_deref()))
     .fetch_one(pool)
     .await?;
 
