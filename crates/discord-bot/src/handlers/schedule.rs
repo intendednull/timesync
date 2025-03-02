@@ -1525,6 +1525,13 @@ async fn handle_prev_day(
     ctx: HandlerContext,
     component: &mut MessageComponentInteraction,
 ) -> Result<()> {
+    // Acknowledge the interaction first - this should be done before any processing
+    // to avoid "interaction has already been acknowledged" errors
+    let _ = component.create_interaction_response(&ctx.ctx.http, |r| {
+        r.kind(InteractionResponseType::DeferredUpdateMessage)
+    }).await;
+    // We use let _ to ignore errors, in case the interaction was already acknowledged
+    
     // Get the poll associated with this message
     let mut polls = ctx.active_polls.write().await;
     let poll = polls.get_mut(&component.message.id)
@@ -1532,12 +1539,7 @@ async fn handle_prev_day(
     
     // Verify we're not already on the first day
     if poll.current_day == 0 {
-        // Already on first day, just acknowledge the interaction
-        // Ignore errors in case it's already acknowledged
-        let _ = component.create_interaction_response(&ctx.ctx.http, |r| {
-            r.kind(InteractionResponseType::DeferredUpdateMessage)
-        }).await;
-        
+        // Already on first day, nothing to do
         return Ok(());
     }
     
@@ -1559,6 +1561,13 @@ async fn handle_next_day(
     ctx: HandlerContext,
     component: &mut MessageComponentInteraction,
 ) -> Result<()> {
+    // Acknowledge the interaction first - this should be done before any processing
+    // to avoid "interaction has already been acknowledged" errors
+    let _ = component.create_interaction_response(&ctx.ctx.http, |r| {
+        r.kind(InteractionResponseType::DeferredUpdateMessage)
+    }).await;
+    // We use let _ to ignore errors, in case the interaction was already acknowledged
+    
     // Get the poll associated with this message
     let mut polls = ctx.active_polls.write().await;
     let poll = polls.get_mut(&component.message.id)
@@ -1566,12 +1575,7 @@ async fn handle_next_day(
     
     // Verify we're not already on the last day
     if poll.current_day >= poll.day_slots.len() - 1 {
-        // Already on last day, just acknowledge the interaction
-        // Ignore errors in case it's already acknowledged
-        let _ = component.create_interaction_response(&ctx.ctx.http, |r| {
-            r.kind(InteractionResponseType::DeferredUpdateMessage)
-        }).await;
-        
+        // Already on last day, nothing to do
         return Ok(());
     }
     
@@ -1597,6 +1601,13 @@ async fn handle_slot_toggle(
     // Get the voter ID
     let voter_id = component.user.id.to_string();
     
+    // Acknowledge the interaction first - this should be done before any processing
+    // to avoid "interaction has already been acknowledged" errors
+    let _ = component.create_interaction_response(&ctx.ctx.http, |r| {
+        r.kind(InteractionResponseType::DeferredUpdateMessage)
+    }).await;
+    // We use let _ to ignore errors, in case the interaction was already acknowledged
+    
     // Get the poll associated with this message
     let mut polls = ctx.active_polls.write().await;
     let poll = polls.get_mut(&component.message.id)
@@ -1610,23 +1621,14 @@ async fn handle_slot_toggle(
     };
     
     if !eligible_voters.contains(&voter_id) {
-        // Acknowledge the interaction
-        component.create_interaction_response(&ctx.ctx.http, |r| {
-            r.kind(InteractionResponseType::ChannelMessageWithSource)
-                .interaction_response_data(|m| {
-                    m.content("You are not a member of any of the groups in this poll, so you cannot vote.")
-                        .ephemeral(true)
-                })
-        }).await?;
+        // Since we've already acknowledged the interaction above, use a follow-up message
+        let _ = component.create_followup_message(&ctx.ctx.http, |m| {
+            m.content("You are not a member of any of the groups in this poll, so you cannot vote.")
+                .ephemeral(true)
+        }).await;
         
         return Ok(());
     }
-    
-    // Acknowledge the interaction first, before making any changes
-    // If it fails (already acknowledged), that's ok - we'll just update the message directly
-    let _ = component.create_interaction_response(&ctx.ctx.http, |r| {
-        r.kind(InteractionResponseType::DeferredUpdateMessage)
-    }).await;
     
     // Toggle this slot for the user
     let user_slots = poll.slot_responses.entry(voter_id.clone()).or_insert_with(Vec::new);
@@ -1658,6 +1660,13 @@ async fn handle_select_all_slots(
     // Get the voter ID
     let voter_id = component.user.id.to_string();
     
+    // Acknowledge the interaction first - this should be done before any processing
+    // to avoid "interaction has already been acknowledged" errors
+    let _ = component.create_interaction_response(&ctx.ctx.http, |r| {
+        r.kind(InteractionResponseType::DeferredUpdateMessage)
+    }).await;
+    // We use let _ to ignore errors, in case the interaction was already acknowledged
+    
     // Get the poll associated with this message
     let mut polls = ctx.active_polls.write().await;
     let poll = polls.get_mut(&component.message.id)
@@ -1671,14 +1680,11 @@ async fn handle_select_all_slots(
     };
     
     if !eligible_voters.contains(&voter_id) {
-        // Acknowledge the interaction
-        component.create_interaction_response(&ctx.ctx.http, |r| {
-            r.kind(InteractionResponseType::ChannelMessageWithSource)
-                .interaction_response_data(|m| {
-                    m.content("You are not a member of any of the groups in this poll, so you cannot vote.")
-                        .ephemeral(true)
-                })
-        }).await?;
+        // Since we've already acknowledged the interaction above, use a follow-up message
+        let _ = component.create_followup_message(&ctx.ctx.http, |m| {
+            m.content("You are not a member of any of the groups in this poll, so you cannot vote.")
+                .ephemeral(true)
+        }).await;
         
         return Ok(());
     }
@@ -1687,12 +1693,6 @@ async fn handle_select_all_slots(
     let current_day_slots = match poll.day_slots.get(&poll.current_day) {
         Some(slots) => slots,
         None => {
-            // No slots for this day, just acknowledge the interaction
-            // Ignore errors in case it's already acknowledged
-            let _ = component.create_interaction_response(&ctx.ctx.http, |r| {
-                r.kind(InteractionResponseType::DeferredUpdateMessage)
-            }).await;
-            
             return Ok(());
         }
     };
@@ -1725,6 +1725,13 @@ async fn handle_clear_all_slots(
     // Get the voter ID
     let voter_id = component.user.id.to_string();
     
+    // Acknowledge the interaction first - this should be done before any processing
+    // to avoid "interaction has already been acknowledged" errors
+    let _ = component.create_interaction_response(&ctx.ctx.http, |r| {
+        r.kind(InteractionResponseType::DeferredUpdateMessage)
+    }).await;
+    // We use let _ to ignore errors, in case the interaction was already acknowledged
+    
     // Get the poll associated with this message
     let mut polls = ctx.active_polls.write().await;
     let poll = polls.get_mut(&component.message.id)
@@ -1738,14 +1745,11 @@ async fn handle_clear_all_slots(
     };
     
     if !eligible_voters.contains(&voter_id) {
-        // Acknowledge the interaction
-        component.create_interaction_response(&ctx.ctx.http, |r| {
-            r.kind(InteractionResponseType::ChannelMessageWithSource)
-                .interaction_response_data(|m| {
-                    m.content("You are not a member of any of the groups in this poll, so you cannot vote.")
-                        .ephemeral(true)
-                })
-        }).await?;
+        // Since we've already acknowledged the interaction above, use a follow-up message
+        let _ = component.create_followup_message(&ctx.ctx.http, |m| {
+            m.content("You are not a member of any of the groups in this poll, so you cannot vote.")
+                .ephemeral(true)
+        }).await;
         
         return Ok(());
     }
@@ -1754,12 +1758,6 @@ async fn handle_clear_all_slots(
     let current_day_slots = match poll.day_slots.get(&poll.current_day) {
         Some(slots) => slots,
         None => {
-            // No slots for this day, just acknowledge the interaction
-            // Ignore errors in case it's already acknowledged
-            let _ = component.create_interaction_response(&ctx.ctx.http, |r| {
-                r.kind(InteractionResponseType::DeferredUpdateMessage)
-            }).await;
-            
             return Ok(());
         }
     };
