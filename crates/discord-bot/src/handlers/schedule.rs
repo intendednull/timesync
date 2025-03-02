@@ -935,8 +935,8 @@ pub async fn handle_match_command(
                         .style(serenity::model::application::component::ButtonStyle::Danger)
                 })
                 .create_button(|b| {
-                    b.custom_id("finish_voting")
-                        .label("Finish Voting")
+                    b.custom_id("submit_votes")
+                        .label("Submit Votes")
                         .style(serenity::model::application::component::ButtonStyle::Primary)
                 })
             })
@@ -1116,9 +1116,9 @@ fn format_time_slots(poll: &super::ActivePoll) -> String {
     message.push_str("\n");
     
     // Add instructions
-    message.push_str("Click on a time to toggle your availability. Blue buttons indicate times you've selected.\n");
+    message.push_str("Click on a time to toggle your availability. Green buttons indicate times you've selected.\n");
     message.push_str("Use the navigation buttons to switch between days.\n");
-    message.push_str("When you're done, click 'Finish Voting' to submit your availability.\n\n");
+    message.push_str("When you're done, click 'Submit Votes' to lock in your selections. If you don't select any times, you'll be marked as unavailable.\n\n");
     
     message
 }
@@ -1140,7 +1140,7 @@ pub async fn handle_component_interaction(
         "next_day" => handle_next_day(ctx, component).await,
         "select_all" => handle_select_all_slots(ctx, component).await,
         "clear_all" => handle_clear_all_slots(ctx, component).await,
-        "finish_voting" => handle_finish_voting(ctx, component).await,
+        "submit_votes" => handle_submit_votes(ctx, component).await,
         _ if custom_id.starts_with("slot_") => {
             let slot_id = custom_id.strip_prefix("slot_").unwrap_or("");
             handle_slot_toggle(ctx, component, slot_id).await
@@ -1782,8 +1782,10 @@ async fn handle_clear_all_slots(
     Ok(())
 }
 
-/// Handle "Finish Voting" button click
-async fn handle_finish_voting(
+/// Handle "Submit Votes" button click
+/// This locks in the member's selected time slots.
+/// If a member submits with no selections, they are marked as unavailable.
+async fn handle_submit_votes(
     ctx: HandlerContext,
     component: &mut MessageComponentInteraction,
 ) -> Result<()> {
@@ -1821,20 +1823,45 @@ async fn handle_finish_voting(
     }).await;
     // Note: We use let _ to ignore errors, in case the interaction was already acknowledged
     
+    // Mark this user as having voted - an empty selection means they're unavailable
+    // If they didn't select any slots, they'll have an empty vector in slot_responses
+    if !poll.slot_responses.contains_key(&voter_id) {
+        poll.slot_responses.insert(voter_id.clone(), Vec::new());
+    }
+
+    // Confirm to the user that their votes have been submitted
+    let _ = component.create_followup_message(&ctx.ctx.http, |m| {
+        let selected_count = poll.slot_responses.get(&voter_id)
+            .map_or(0, |slots| slots.len());
+        
+        if selected_count > 0 {
+            m.content(format!("Your votes have been submitted! You selected {} time slots.", selected_count))
+        } else {
+            m.content("Your response has been recorded. You didn't select any time slots, so you're marked as unavailable.")
+        }
+        .ephemeral(true)
+    }).await;
+
     // Get users who have voted
     let voted_users: std::collections::HashSet<String> = poll.slot_responses.keys().cloned().collect();
     
-    // Check if we've reached completion criteria:
-    // 1. Have all required members voted? 
-    // 2. Or do we have enough votes to know the outcome?
-    let mut voting_complete = true;
+    // Check if minimum requirements can be met with current votes
     let mut min_requirements_possible = true;
+    let mut all_groups_have_enough = true;
     let mut groups_status = Vec::new();
     
     for (idx, (_group_id, members)) in poll.group_members.iter().enumerate() {
         let min_required = poll.min_per_group as usize;
-        let voted_count = members.iter().filter(|m| voted_users.contains(*m)).count();
-        let remaining_count = members.len() - voted_count;
+        
+        // Get members who selected at least one time slot (not just voted)
+        let available_count = members.iter()
+            .filter(|m| {
+                poll.slot_responses.get(*m)
+                    .map_or(false, |slots| !slots.is_empty())
+            })
+            .count();
+        
+        let remaining_count = members.len() - voted_users.intersection(&members.iter().cloned().collect()).count();
         
         // Keep track of the group's status for the message
         let group_name = poll.group_names.get(idx)
@@ -1842,28 +1869,27 @@ async fn handle_finish_voting(
             .clone();
         
         // Is it still possible to reach the minimum required members?
-        let available_votes = voted_count + remaining_count;
+        let max_possible_available = available_count + remaining_count;
         
-        // If we can't reach the minimum requirement even if everyone else votes,
+        // If we can't reach the minimum requirement even if all remaining members vote as available,
         // then voting is effectively complete and we know the result will be negative
-        if available_votes < min_required {
+        if max_possible_available < min_required {
             min_requirements_possible = false;
-            groups_status.push((group_name, voted_count, min_required, false));
+            groups_status.push((group_name, available_count, min_required, false));
         } else {
             // Otherwise, check if we've met the minimum already
-            let min_met = voted_count >= min_required;
-            groups_status.push((group_name, voted_count, min_required, min_met));
+            let min_met = available_count >= min_required;
+            groups_status.push((group_name, available_count, min_required, min_met));
             
-            // If not everyone has voted and we haven't met the minimum,
-            // then voting isn't complete
-            if voted_count < min_required && voted_count < members.len() {
-                voting_complete = false;
+            if !min_met {
+                all_groups_have_enough = false;
             }
         }
     }
     
-    // If minimum requirements can't be met, or if everyone has voted, we're done
-    if !min_requirements_possible || voting_complete {
+    // If minimum requirements can't be met, or if all groups have enough votes and they've found an overlapping time slot,
+    // we can finish the voting process
+    if !min_requirements_possible || all_groups_have_enough {
         // If requirements can't be met, there's no point in finding an optimal slot
         if !min_requirements_possible {
             // Show a message explaining why voting failed
@@ -1913,7 +1939,7 @@ async fn handle_finish_voting(
                         e.title("Not Enough Members Available")
                             .description(description)
                             .color(Color::RED)
-                            .footer(|f| f.text("Consider adjusting the minimum requirements or try with different groups"))
+                            .footer(|f| f.text("Members who submitted without selecting any slots are considered unavailable"))
                     })
                     .components(|c| c) // Clear components
             }).await?;
@@ -2003,7 +2029,7 @@ async fn handle_finish_voting(
                             .description(description)
                             .color(Color::DARK_GREEN)
                             .footer(|f| f.text(format!(
-                                "Min members per group: {} • {} attendees • Timezone: {}",
+                                "Min members per group: {} • {} attendees • Timezone: {} • Only members who selected this slot are listed as attendees",
                                 poll.min_per_group,
                                 attending_users.len(),
                                 poll.timezone
@@ -2157,8 +2183,8 @@ async fn update_time_slot_message(
                         .style(serenity::model::application::component::ButtonStyle::Danger)
                 })
                 .create_button(|b| {
-                    b.custom_id("finish_voting")
-                        .label("Finish Voting")
+                    b.custom_id("submit_votes")
+                        .label("Submit Votes")
                         .style(serenity::model::application::component::ButtonStyle::Primary)
                 })
             })
@@ -2173,8 +2199,19 @@ fn find_optimal_meeting_slot(poll: &super::ActivePoll) -> Option<(usize, super::
     // A map to track votes for each slot
     let mut slot_votes: HashMap<String, Vec<String>> = HashMap::new();
     
-    // Collect all votes
+    // Get the set of users who submitted votes but selected nothing (marked as unavailable)
+    let unavailable_users: std::collections::HashSet<String> = poll.slot_responses.iter()
+        .filter(|(_, slots)| slots.is_empty())
+        .map(|(user_id, _)| user_id.clone())
+        .collect();
+    
+    // Collect all votes from users who selected at least one slot
     for (user_id, selected_slots) in &poll.slot_responses {
+        // Skip users who submitted with no selections (they're marked as unavailable)
+        if selected_slots.is_empty() {
+            continue;
+        }
+        
         for slot_id in selected_slots {
             slot_votes.entry(slot_id.clone())
                 .or_insert_with(Vec::new)
@@ -2196,6 +2233,7 @@ fn find_optimal_meeting_slot(poll: &super::ActivePoll) -> Option<(usize, super::
             let mut group_counts: HashMap<uuid::Uuid, usize> = HashMap::new();
             
             for (group_id, members) in &poll.group_members {
+                // Count members who explicitly selected this slot
                 let group_vote_count = members.iter()
                     .filter(|member_id| voters.contains(member_id))
                     .count();
