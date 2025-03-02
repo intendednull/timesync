@@ -47,11 +47,15 @@ async fn handle_schedule_create(
     ctx: HandlerContext, 
     command: &ApplicationCommandInteraction
 ) -> Result<()> {
-    // Get the user's Discord ID
+    // Get the user's Discord ID and username
     let discord_id = command.user.id.to_string();
+    let username = &command.user.name;
     
-    // Generate a unique URL for schedule creation
-    let schedule_url = format!("{}/create?discord_id={}", ctx.config.web_base_url, discord_id);
+    // Generate a unique URL for schedule creation with discord_id and default name
+    let schedule_url = format!("{}/create?discord_id={}&name={}", 
+        ctx.config.web_base_url, 
+        discord_id, 
+        urlencoding::encode(username));
     
     // Send a response with the URL
     command.create_interaction_response(&ctx.ctx.http, |r| {

@@ -3,7 +3,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const selectedTimeSlots = new Set();
     let isMouseDown = false;
     let isSelecting = true; // true = selecting, false = deselecting
-    let isRecurringMode = false; // Toggle between specific dates and recurring weekly pattern
+    let isRecurringMode = true; // Toggle between specific dates and recurring weekly pattern - default to weekly
     let currentTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone; // Default to local timezone
     
     // Box selection state variables
@@ -14,20 +14,37 @@ document.addEventListener('DOMContentLoaded', () => {
     // Date handling
     let currentWeekStart = getStartOfWeek(new Date());
     
-    // Check for discord_id parameter in URL
-    const urlParams = new URLSearchParams(window.location.search);
-    const discordId = urlParams.get('discord_id');
-    if (discordId) {
-        // Set the discord_id field if it exists in the URL
-        document.getElementById('discord-id').value = discordId;
-    }
-    
     // Initialize timezone selector
     populateTimezoneSelector();
     
     // Initialize the time grid
     initializeTimeGrid();
     updateDateRange();
+    
+    // Now that the DOM is initialized, check for URL parameters and fill form fields
+    setTimeout(() => {
+        const urlParams = new URLSearchParams(window.location.search);
+        const discordId = urlParams.get('discord_id');
+        const nameParam = urlParams.get('name');
+        
+        // Set the name field if it exists in the URL
+        if (nameParam) {
+            const nameField = document.getElementById('schedule-name');
+            if (nameField) {
+                nameField.value = decodeURIComponent(nameParam);
+                console.log('Name field updated:', nameField.value);
+            }
+        }
+        
+        // Set the discord_id field if it exists in the URL
+        if (discordId) {
+            const discordField = document.getElementById('discord-id');
+            if (discordField) {
+                discordField.value = discordId;
+                console.log('Discord ID field updated:', discordField.value);
+            }
+        }
+    }, 10); // Small delay to ensure DOM is fully ready
     
     // Event listeners for week navigation
     document.getElementById('prev-week').addEventListener('click', () => {
@@ -54,6 +71,22 @@ document.addEventListener('DOMContentLoaded', () => {
     const dateRangeText = document.getElementById('current-date-range');
     const timeControlsDiv = document.querySelector('.time-controls');
     const weeklyHeaderDiv = document.getElementById('weekly-header');
+    
+    // Set the initial toggle state to reflect our default recurring mode
+    recurringToggle.checked = isRecurringMode;
+    
+    // Update initial UI based on our default recurring mode
+    if (isRecurringMode) {
+        // Weekly view is default
+        scheduleDescription.textContent = 'Setting a weekly recurring pattern. All selected times will repeat weekly.';
+        // Hide date controls and show weekly header
+        timeControlsDiv.style.display = 'none';
+        weeklyHeaderDiv.style.display = 'block';
+    } else {
+        scheduleDescription.textContent = 'Currently selecting specific dates. Toggle to set a weekly recurring pattern instead.';
+        timeControlsDiv.style.display = 'flex';
+        weeklyHeaderDiv.style.display = 'none';
+    }
     
     recurringToggle.addEventListener('change', () => {
         isRecurringMode = recurringToggle.checked;
