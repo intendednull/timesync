@@ -641,10 +641,8 @@ pub async fn handle_match_command(
         .and_then(|val| val.as_i64())
         .unwrap_or(1);
     
-    let count = command.data.options.get(2)
-        .and_then(|opt| opt.value.as_ref())
-        .and_then(|val| val.as_i64())
-        .unwrap_or(5);
+    // Request a high number of matches to avoid running out
+    let count = 50; // Set to a high value instead of using a parameter
     
     // Parse the group names
     let group_names: Vec<String> = groups_str
@@ -730,20 +728,36 @@ pub async fn handle_match_command(
         return Ok(());
     }
     
-    // Calculate the total number of unique users in all groups
-    let first_match = &match_response.matches[0];
-    let mut unique_user_ids = std::collections::HashSet::new();
+    // Collect all eligible voters (members of the chosen groups)
+    let mut eligible_voter_ids = std::collections::HashSet::new();
+    let mut group_members = HashMap::new();
     
-    for group in &first_match.groups {
-        for user_id in &group.available_users {
-            unique_user_ids.insert(user_id);
+    // Get all members of all groups
+    for group_id in &match_request.group_ids {
+        let members = sqlx::query!(
+            "SELECT discord_id FROM group_members WHERE group_id = $1",
+            group_id
+        )
+        .fetch_all(&ctx.db_pool)
+        .await?;
+        
+        // Create a vector of member IDs for this group
+        let mut member_ids = Vec::new();
+        
+        for member in members {
+            eligible_voter_ids.insert(member.discord_id.clone());
+            member_ids.push(member.discord_id);
         }
+        
+        // Store the member list for this group
+        group_members.insert(*group_id, member_ids);
     }
-    let total_unique_users = unique_user_ids.len();
     
-    // Determine how many users need to say yes for the time to be confirmed
-    // Using a simple majority (over 50%)
-    let required_yes_count = (total_unique_users as f64 * 0.5).ceil() as usize;
+    // Set the required "Yes" votes (6 per group or all members if less than 6)
+    let mut required_yes_count = 0;
+    for (_, members) in &group_members {
+        required_yes_count += std::cmp::min(6, members.len());
+    }
     
     // Get the server's timezone or use UTC as default
     let timezone = async {
@@ -783,6 +797,9 @@ pub async fn handle_match_command(
         }
     }.await;
     
+    // Store eligible voters as a comma-separated list of IDs
+    let eligible_voters_str = eligible_voter_ids.into_iter().collect::<Vec<_>>().join(",");
+    
     // Create initial poll with first match
     let active_poll = super::ActivePoll {
         matches: match_response.matches.clone(),
@@ -793,6 +810,8 @@ pub async fn handle_match_command(
         responses: HashMap::new(),
         db_pool: ctx.db_pool.clone(),
         timezone,
+        eligible_voters: eligible_voters_str.clone(),
+        group_members,
     };
     
     // Create a formatted response with just the first match
@@ -856,17 +875,6 @@ pub async fn handle_match_command(
                         .style(serenity::model::application::component::ButtonStyle::Danger)
                 })
             })
-            .create_action_row(|row| {
-                if active_poll.matches.len() > 1 {
-                    row.create_button(|b| {
-                        b.custom_id("match_next")
-                            .label("Next Option")
-                            .style(serenity::model::application::component::ButtonStyle::Secondary)
-                    })
-                } else {
-                    row
-                }
-            })
         })
     }).await?;
     
@@ -888,7 +896,6 @@ pub async fn handle_component_interaction(
     
     match custom_id.as_str() {
         "match_yes" | "match_no" => handle_match_vote(ctx, component, custom_id == "match_yes").await,
-        "match_next" => handle_match_next(ctx, component).await,
         "match_confirm" => handle_match_confirm(ctx, component).await,
         _ => Ok(()),
     }
@@ -900,25 +907,70 @@ async fn handle_match_vote(
     component: &mut MessageComponentInteraction,
     is_yes: bool,
 ) -> Result<()> {
-    // Acknowledge the interaction
-    component.create_interaction_response(&ctx.ctx.http, |r| {
-        r.kind(InteractionResponseType::DeferredUpdateMessage)
-    }).await?;
-
     // Get the poll associated with this message
     let mut polls = ctx.active_polls.write().await;
     let poll = polls.get_mut(&component.message.id)
         .ok_or_else(|| eyre::eyre!("No active poll found for this message"))?;
     
+    // Get the voter ID
+    let voter_id = component.user.id.to_string();
+    
+    // Check if the user is an eligible voter (member of one of the selected groups)
+    let eligible_voters: Vec<String> = if poll.eligible_voters.is_empty() {
+        Vec::new()
+    } else {
+        poll.eligible_voters.split(',').map(|s| s.to_string()).collect()
+    };
+    
+    if !eligible_voters.contains(&voter_id) {
+        // Acknowledge the interaction
+        component.create_interaction_response(&ctx.ctx.http, |r| {
+            r.kind(InteractionResponseType::ChannelMessageWithSource)
+                .interaction_response_data(|m| {
+                    m.content("You are not a member of any of the groups in this poll, so you cannot vote.")
+                        .ephemeral(true)
+                })
+        }).await?;
+        
+        return Ok(());
+    }
+    
+    // Acknowledge the interaction
+    component.create_interaction_response(&ctx.ctx.http, |r| {
+        r.kind(InteractionResponseType::DeferredUpdateMessage)
+    }).await?;
+    
     // Record the user's response
-    let user_id = component.user.id.to_string();
-    poll.responses.insert(user_id, is_yes);
+    poll.responses.insert(voter_id, is_yes);
     
-    // Count yes votes
+    // Count yes votes for each group
+    let mut group_yes_votes = HashMap::new();
+    for (group_id, members) in &poll.group_members {
+        let group_yes = members.iter()
+            .filter(|&member_id| poll.responses.get(member_id).map_or(false, |&vote| vote))
+            .count();
+        group_yes_votes.insert(*group_id, group_yes);
+    }
+    
+    // Check if each group has at least min(6, total_members) yes votes
+    let mut all_groups_have_enough = true;
+    for (group_id, members) in &poll.group_members {
+        let required_for_group = std::cmp::min(6, members.len());
+        let actual_yes = *group_yes_votes.get(group_id).unwrap_or(&0);
+        
+        if actual_yes < required_for_group {
+            all_groups_have_enough = false;
+            break;
+        }
+    }
+    
+    // Count total yes and no votes for UI display
     let yes_votes = poll.responses.values().filter(|&&v| v).count();
+    let no_votes = poll.responses.values().filter(|&&v| !v).count();
+    let total_voters = eligible_voters.len();
     
-    // Check if we have enough yes votes
-    if yes_votes >= poll.required_yes_count {
+    // Check if we have reached the minimum threshold for yes votes from each group
+    if all_groups_have_enough {
         // Enough people agreed to this time, confirm it
         let match_result = &poll.matches[poll.current_index];
         
@@ -1026,147 +1078,184 @@ async fn handle_match_vote(
         // Remove the poll from active polls
         polls.remove(&component.message.id);
     } else {
-        // Update the message to show the updated vote count
-        let match_message = format_match_option(poll, poll.current_index, poll.required_yes_count);
+        // Check if it's impossible to get enough yes votes for any group
+        let mut impossible_to_get_enough = false;
         
-        // Gather role IDs for all groups to ping during voting
-        let mut role_mentions = Vec::new();
-        for group_name in &poll.group_names {
-            // Query to get the role ID for this group
-            let role_query = sqlx::query(
-                "SELECT role_id FROM discord_groups WHERE name = $1 AND server_id = $2"
-            )
-            .bind(group_name)
-            .bind(component.guild_id.unwrap().to_string())
-            .fetch_optional(&ctx.db_pool)
-            .await;
+        for (group_id, members) in &poll.group_members {
+            let required_for_group = std::cmp::min(6, members.len());
+            let current_yes = members.iter()
+                .filter(|&member_id| poll.responses.get(member_id).map_or(false, |&vote| vote))
+                .count();
             
-            if let Ok(Some(row)) = role_query {
-                if let Ok(role_id) = row.try_get::<Option<String>, _>("role_id") {
-                    if let Some(id) = role_id {
-                        role_mentions.push(format!("<@&{}>", id));
-                    }
-                }
+            let remaining_votes = members.iter()
+                .filter(|&member_id| !poll.responses.contains_key(member_id))
+                .count();
+            
+            // If current yes + remaining potential votes is less than required, 
+            // it's impossible to reach the threshold
+            if current_yes + remaining_votes < required_for_group {
+                impossible_to_get_enough = true;
+                break;
             }
         }
         
-        let role_ping = if !role_mentions.is_empty() {
-            format!("🗣️ {} Please vote on this meeting time proposal!", role_mentions.join(" "))
+        if impossible_to_get_enough {
+            // Too many "No" votes, making it impossible to get the required votes per group
+            // Move to the next option if available
+            if poll.matches.len() > 1 {
+                // There are more time options, move to the next one
+                let current_index = poll.current_index;
+                poll.current_index = (current_index + 1) % poll.matches.len();
+                
+                // Clear votes when moving to a new option
+                poll.responses.clear();
+                
+                // Update the message to show the next option
+                let match_message = format_match_option(poll, poll.current_index, poll.required_yes_count);
+                
+                // Gather role IDs for all groups to ping during voting
+                let mut role_mentions = Vec::new();
+                for group_name in &poll.group_names {
+                    // Query to get the role ID for this group
+                    let role_query = sqlx::query(
+                        "SELECT role_id FROM discord_groups WHERE name = $1 AND server_id = $2"
+                    )
+                    .bind(group_name)
+                    .bind(component.guild_id.unwrap().to_string())
+                    .fetch_optional(&ctx.db_pool)
+                    .await;
+                    
+                    if let Ok(Some(row)) = role_query {
+                        if let Ok(role_id) = row.try_get::<Option<String>, _>("role_id") {
+                            if let Some(id) = role_id {
+                                role_mentions.push(format!("<@&{}>", id));
+                            }
+                        }
+                    }
+                }
+                
+                let auto_advance_message = format!(
+                    "🔄 Not enough people were available for the previous time slot. Moving to option {} of {}. Please vote again!",
+                    poll.current_index + 1,
+                    poll.matches.len()
+                );
+                
+                component.message.edit(&ctx.ctx.http, |m| {
+                    m.content(&auto_advance_message);
+                    
+                    m.embed(|e| {
+                        e.title(format!("Proposed Meeting Time ({} of {})", 
+                                      poll.current_index + 1, 
+                                      poll.matches.len()))
+                            .description(&match_message)
+                            .color(Color::GOLD)
+                            .footer(|f| f.text(format!(
+                                "Min members per group: {} • {}/{} yes votes needed • Generated at: {}",
+                                poll.min_per_group,
+                                0, // Reset counter
+                                poll.required_yes_count,
+                                Utc::now().format("%Y-%m-%d %H:%M UTC")
+                            )))
+                    })
+                    .components(|c| {
+                        c.create_action_row(|row| {
+                            row.create_button(|b| {
+                                b.custom_id("match_yes")
+                                    .label("Yes")
+                                    .style(serenity::model::application::component::ButtonStyle::Success)
+                            })
+                            .create_button(|b| {
+                                b.custom_id("match_no")
+                                    .label("No")
+                                    .style(serenity::model::application::component::ButtonStyle::Danger)
+                            })
+                        })
+                    })
+                }).await?;
+            } else {
+                // We've tried all options and none worked
+                let no_solution_message = "❌ We've gone through all available time options and none received enough votes.";
+                
+                component.message.edit(&ctx.ctx.http, |m| {
+                    m.content(no_solution_message)
+                     .embed(|e| {
+                        e.title("No Suitable Time Found")
+                            .description("We've tried all possible meeting times, but none received enough confirmations. You may want to try again with different groups or ask members to update their availability schedules.")
+                            .color(Color::RED)
+                     })
+                     .components(|c| c) // Clear components
+                }).await?;
+                
+                // Remove the poll from active polls
+                polls.remove(&component.message.id);
+            }
         } else {
-            String::new()
-        };
-        
-        component.message.edit(&ctx.ctx.http, |m| {
-            if !role_ping.is_empty() {
-                m.content(&role_ping);
+            // Update the message to show the updated vote count
+            let match_message = format_match_option(poll, poll.current_index, poll.required_yes_count);
+            
+            // Gather role IDs for all groups to ping during voting
+            let mut role_mentions = Vec::new();
+            for group_name in &poll.group_names {
+                // Query to get the role ID for this group
+                let role_query = sqlx::query(
+                    "SELECT role_id FROM discord_groups WHERE name = $1 AND server_id = $2"
+                )
+                .bind(group_name)
+                .bind(component.guild_id.unwrap().to_string())
+                .fetch_optional(&ctx.db_pool)
+                .await;
+                
+                if let Ok(Some(row)) = role_query {
+                    if let Ok(role_id) = row.try_get::<Option<String>, _>("role_id") {
+                        if let Some(id) = role_id {
+                            role_mentions.push(format!("<@&{}>", id));
+                        }
+                    }
+                }
             }
             
-            m.embed(|e| {
-                e.title(format!("Proposed Meeting Time ({} of {})", 
-                               poll.current_index + 1, 
-                               poll.matches.len()))
-                    .description(&match_message)
-                    .color(Color::GOLD)
-                    .footer(|f| f.text(format!(
-                        "Min members per group: {} • {}/{} yes votes needed • Generated at: {}",
-                        poll.min_per_group,
-                        yes_votes,
-                        poll.required_yes_count,
-                        Utc::now().format("%Y-%m-%d %H:%M UTC")
-                    )))
-            })
-            .components(|c| {
-                c.create_action_row(|row| {
-                    row.create_button(|b| {
-                        b.custom_id("match_yes")
-                            .label("Yes")
-                            .style(serenity::model::application::component::ButtonStyle::Success)
-                    })
-                    .create_button(|b| {
-                        b.custom_id("match_no")
-                            .label("No")
-                            .style(serenity::model::application::component::ButtonStyle::Danger)
-                    })
+            let role_ping = if !role_mentions.is_empty() {
+                format!("🗣️ {} Please vote on this meeting time proposal!", role_mentions.join(" "))
+            } else {
+                String::new()
+            };
+            
+            component.message.edit(&ctx.ctx.http, |m| {
+                if !role_ping.is_empty() {
+                    m.content(&role_ping);
+                }
+                
+                m.embed(|e| {
+                    e.title(format!("Proposed Meeting Time ({} of {})", 
+                                   poll.current_index + 1, 
+                                   poll.matches.len()))
+                        .description(&match_message)
+                        .color(Color::GOLD)
+                        .footer(|f| f.text(format!(
+                            "Min members per group: {} • {}/{} yes votes needed • Generated at: {}",
+                            poll.min_per_group,
+                            yes_votes,
+                            poll.required_yes_count,
+                            Utc::now().format("%Y-%m-%d %H:%M UTC")
+                        )))
                 })
-                .create_action_row(|row| {
-                    if poll.matches.len() > 1 {
+                .components(|c| {
+                    c.create_action_row(|row| {
                         row.create_button(|b| {
-                            b.custom_id("match_next")
-                                .label("Next Option")
-                                .style(serenity::model::application::component::ButtonStyle::Secondary)
+                            b.custom_id("match_yes")
+                                .label("Yes")
+                                .style(serenity::model::application::component::ButtonStyle::Success)
                         })
-                    } else {
-                        row
-                    }
+                        .create_button(|b| {
+                            b.custom_id("match_no")
+                                .label("No")
+                                .style(serenity::model::application::component::ButtonStyle::Danger)
+                        })
+                    })
                 })
-            })
-        }).await?;
+            }).await?;
+        }
     }
-    
-    Ok(())
-}
-
-/// Handle the "Next Option" button to cycle through matches
-async fn handle_match_next(
-    ctx: HandlerContext,
-    component: &mut MessageComponentInteraction,
-) -> Result<()> {
-    // Acknowledge the interaction
-    component.create_interaction_response(&ctx.ctx.http, |r| {
-        r.kind(InteractionResponseType::DeferredUpdateMessage)
-    }).await?;
-
-    // Get the poll associated with this message
-    let mut polls = ctx.active_polls.write().await;
-    let poll = polls.get_mut(&component.message.id)
-        .ok_or_else(|| eyre::eyre!("No active poll found for this message"))?;
-    
-    // Move to the next match option, or wrap around to the first
-    poll.current_index = (poll.current_index + 1) % poll.matches.len();
-    
-    // Count yes votes
-    let yes_votes = poll.responses.values().filter(|&&v| v).count();
-    
-    // Update the message to show the next option
-    let match_message = format_match_option(poll, poll.current_index, poll.required_yes_count);
-    
-    component.message.edit(&ctx.ctx.http, |m| {
-        m.embed(|e| {
-            e.title(format!("Proposed Meeting Time ({} of {})", 
-                           poll.current_index + 1, 
-                           poll.matches.len()))
-                .description(&match_message)
-                .color(Color::GOLD)
-                .footer(|f| f.text(format!(
-                    "Min members per group: {} • {}/{} yes votes needed • Generated at: {}",
-                    poll.min_per_group,
-                    yes_votes,
-                    poll.required_yes_count,
-                    Utc::now().format("%Y-%m-%d %H:%M UTC")
-                )))
-        })
-        .components(|c| {
-            c.create_action_row(|row| {
-                row.create_button(|b| {
-                    b.custom_id("match_yes")
-                        .label("Yes")
-                        .style(serenity::model::application::component::ButtonStyle::Success)
-                })
-                .create_button(|b| {
-                    b.custom_id("match_no")
-                        .label("No")
-                        .style(serenity::model::application::component::ButtonStyle::Danger)
-                })
-            })
-            .create_action_row(|row| {
-                row.create_button(|b| {
-                    b.custom_id("match_next")
-                        .label("Next Option")
-                        .style(serenity::model::application::component::ButtonStyle::Secondary)
-                })
-            })
-        })
-    }).await?;
     
     Ok(())
 }
@@ -1220,35 +1309,56 @@ fn format_match_option(poll: &super::ActivePoll, index: usize, required_yes: usi
     // Add group information
     description.push_str("**Available Members:**\n");
     for group in &match_result.groups {
+        // Find the group in the poll's group_members
+        let group_members = poll.group_members.get(&group.id);
+        let required_for_group = if let Some(members) = group_members {
+            std::cmp::min(6, members.len())
+        } else {
+            6 // Default if not found
+        };
+        
+        // Count yes votes for this group
+        let group_yes_votes = group.available_users.iter()
+            .filter(|&user_id| poll.responses.get(user_id).map_or(false, |&vote| vote))
+            .count();
+        
         description.push_str(&format!(
-            "• **{}**: {} {}\n",
+            "• **{}**: {} {} ({}/{} yes votes needed)\n",
             group.name,
             group.count,
-            if group.count == 1 { "member" } else { "members" }
+            if group.count == 1 { "member" } else { "members" },
+            group_yes_votes,
+            required_for_group
         ));
         
         // List the available users for each group
         if !group.available_users.is_empty() {
             for user_id in &group.available_users {
-                description.push_str(&format!("  - <@{}>\n", user_id));
+                // Get vote status if they've voted
+                let vote_status = match poll.responses.get(user_id) {
+                    Some(true) => " ✅",
+                    Some(false) => " ❌",
+                    None => ""
+                };
+                
+                description.push_str(&format!("  - <@{}>{}\n", user_id, vote_status));
             }
         }
     }
     
-    // Add responses if there are any
-    let yes_count = poll.responses.iter().filter(|&(_, v)| *v).count();
+    // Add responses if there are any from users not in the available lists
     let yes_users: Vec<&String> = poll.responses.iter()
-        .filter(|&(_, v)| *v)
+        .filter(|&(user_id, &v)| v && !match_result.groups.iter().any(|g| g.available_users.contains(user_id)))
         .map(|(user_id, _)| user_id)
         .collect();
     
     let no_users: Vec<&String> = poll.responses.iter()
-        .filter(|&(_, v)| !(*v))
+        .filter(|&(user_id, &v)| !v && !match_result.groups.iter().any(|g| g.available_users.contains(user_id)))
         .map(|(user_id, _)| user_id)
         .collect();
     
     if !yes_users.is_empty() || !no_users.is_empty() {
-        description.push_str("\n**Current Responses:**\n");
+        description.push_str("\n**Additional Responses:**\n");
         
         if !yes_users.is_empty() {
             description.push_str("✅ **Yes:**\n");
@@ -1265,12 +1375,40 @@ fn format_match_option(poll: &super::ActivePoll, index: usize, required_yes: usi
         }
     }
     
-    // Add progress indicator
-    description.push_str(&format!(
-        "\n{}/{} yes votes needed to confirm this time",
-        yes_count,
-        required_yes
-    ));
+    // Calculate progress for each group
+    let mut vote_requirements = String::new();
+    let mut all_groups_have_enough = true;
+    
+    for (group_id, group_name) in match_result.groups.iter().map(|g| (g.id, g.name.clone())) {
+        if let Some(members) = poll.group_members.get(&group_id) {
+            let required_for_group = std::cmp::min(6, members.len());
+            let group_yes_votes = members.iter()
+                .filter(|&user_id| poll.responses.get(user_id).map_or(false, |&vote| vote))
+                .count();
+            
+            vote_requirements.push_str(&format!(
+                "• Group {}: {}/{} yes votes\n",
+                group_name,
+                group_yes_votes,
+                required_for_group
+            ));
+            
+            if group_yes_votes < required_for_group {
+                all_groups_have_enough = false;
+            }
+        }
+    }
+    
+    if !vote_requirements.is_empty() {
+        description.push_str("\n**Voting Progress:**\n");
+        description.push_str(&vote_requirements);
+        
+        if all_groups_have_enough {
+            description.push_str("\n✅ **All groups have enough votes!**");
+        } else {
+            description.push_str("\n⏳ **Waiting for more votes...**");
+        }
+    }
     
     description
 }

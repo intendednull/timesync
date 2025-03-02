@@ -135,13 +135,6 @@ pub fn match_command() -> CreateApplicationCommand {
                 .description("Minimum number of users required from each group")
                 .kind(CommandOptionType::Integer)
                 .required(false)
-        })
-        .create_option(|option| {
-            option
-                .name("count")
-                .description("Number of suggestions to return (default: 5)")
-                .kind(CommandOptionType::Integer)
-                .required(false)
         });
     
     command

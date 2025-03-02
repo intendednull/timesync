@@ -184,6 +184,8 @@ pub struct ActivePoll {
     pub responses: HashMap<String, bool>, // user_id -> yes/no
     pub db_pool: sqlx::PgPool,
     pub timezone: String,
+    pub eligible_voters: String, // Comma-separated list of eligible voter IDs
+    pub group_members: HashMap<uuid::Uuid, Vec<String>>, // group_id -> list of member IDs
 }
 
 /// Shared context for command handlers.
