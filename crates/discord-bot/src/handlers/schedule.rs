@@ -900,7 +900,7 @@ pub async fn handle_match_command(
                             row.create_button(|b| {
                                 b.custom_id(format!("slot_{}", slot.id))
                                     .label(format!("{} [0]", &slot.formatted_time)) // Start with zero votes
-                                    .style(serenity::model::application::component::ButtonStyle::Secondary)
+                                    .style(serenity::model::application::component::ButtonStyle::Success) // Start as selected
                             });
                         }
                         row
@@ -938,7 +938,7 @@ pub async fn handle_match_command(
                 })
                 .create_button(|b| {
                     b.custom_id("clear_all")
-                        .label("Clear All")
+                        .label("Clear All Days")
                         .style(serenity::model::application::component::ButtonStyle::Danger)
                 })
                 .create_button(|b| {
@@ -950,10 +950,24 @@ pub async fn handle_match_command(
         })
     }).await?;
     
-    // Store the poll state
+    // Pre-select all time slots for all eligible voters before storing the poll
+    // This makes the default state "available" for all time slots
     {
+        let mut modified_poll = active_poll.clone();
+        
+        // Get all slot IDs from all days
+        let all_slot_ids: Vec<String> = modified_poll.day_slots.values()
+            .flat_map(|slots| slots.iter().map(|slot| slot.id.clone()))
+            .collect();
+        
+        // For each eligible voter, pre-select all slots
+        for voter_id in modified_poll.eligible_voters.split(',').filter(|s| !s.is_empty()) {
+            modified_poll.slot_responses.insert(voter_id.to_string(), all_slot_ids.clone());
+        }
+        
+        // Store the poll state with pre-selected slots
         let mut polls = ctx.active_polls.write().await;
-        polls.insert(message.id, active_poll);
+        polls.insert(message.id, modified_poll);
     }
     
     Ok(())
@@ -1104,9 +1118,9 @@ fn format_time_slots(poll: &super::ActivePoll) -> String {
     // Time slots are now shown directly in the buttons
     
     // Add instructions
-    message.push_str("Click on a time to toggle your availability. Green buttons indicate times you've selected. The number in brackets [0] shows how many people have selected that time.\n");
-    message.push_str("Use the navigation buttons to switch between days.\n");
-    message.push_str("When you're done, click 'Submit Votes' to lock in your selections. If you don't select any times, you'll be marked as unavailable.\n\n");
+    message.push_str("Click on a time to toggle your availability. All times are selected by default. Green buttons indicate times you're available for. The number in brackets [0] shows how many people have selected that time.\n");
+    message.push_str("Use the navigation buttons to switch between days. 'Clear All Days' will mark you as unavailable for all days.\n");
+    message.push_str("When you're done, click 'Submit Votes' to lock in your selections. If you've cleared all times, you'll be marked as unavailable.\n\n");
     
     message
 }
@@ -1742,23 +1756,9 @@ async fn handle_clear_all_slots(
         return Ok(());
     }
     
-    // Get all slot IDs for the current day
-    let current_day_slots = match poll.day_slots.get(&poll.current_day) {
-        Some(slots) => slots,
-        None => {
-            return Ok(());
-        }
-    };
-    
-    // Clear all slots for this day
-    let user_slots = poll.slot_responses.entry(voter_id.clone()).or_insert_with(Vec::new);
-    
-    // Remove all slots from the current day
-    for slot in current_day_slots {
-        if let Some(index) = user_slots.iter().position(|s| s == &slot.id) {
-            user_slots.remove(index);
-        }
-    }
+    // Clear ALL slots for ALL days
+    // Just empty the user's selected slots completely
+    poll.slot_responses.insert(voter_id.clone(), Vec::new());
     
     // Get a clone of the poll before releasing the lock
     let poll_clone = poll.clone();
@@ -2172,7 +2172,7 @@ async fn update_time_slot_message(
                 })
                 .create_button(|b| {
                     b.custom_id("clear_all")
-                        .label("Clear All")
+                        .label("Clear All Days")
                         .style(serenity::model::application::component::ButtonStyle::Danger)
                 })
                 .create_button(|b| {
