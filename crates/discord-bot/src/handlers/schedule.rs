@@ -1948,7 +1948,7 @@ async fn handle_submit_votes(
             
             // Create description for the message
             let mut description = format!(
-                "**Meeting Time Confirmed!**\n\n**{}**\n**{}**\n\n",
+                "**{}**\n**{}**\n\n",
                 day_date,
                 slot_info.formatted_time
             );
