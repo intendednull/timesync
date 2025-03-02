@@ -645,11 +645,11 @@ pub async fn handle_match_command(
         .and_then(|val| val.as_i64())
         .unwrap_or(1);
         
-    // Get slot duration (default to 60 minutes)
+    // Get slot duration (default to 120 minutes / 2 hours)
     let slot_duration = command.data.options.get(2)
         .and_then(|opt| opt.value.as_ref())
         .and_then(|val| val.as_i64())
-        .unwrap_or(60);
+        .unwrap_or(120);
         
     // Get max days to display (default to 7, clamp between 1-7)
     let display_days = command.data.options.get(3)

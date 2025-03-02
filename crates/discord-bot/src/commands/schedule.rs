@@ -139,7 +139,7 @@ pub fn match_command() -> CreateApplicationCommand {
         .create_option(|option| {
             option
                 .name("slot_duration")
-                .description("Duration of each time slot in minutes (default: 60)")
+                .description("Duration of each time slot in minutes (default: 120)")
                 .kind(CommandOptionType::Integer)
                 .required(false)
         })
