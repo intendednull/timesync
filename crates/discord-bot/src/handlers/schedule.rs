@@ -857,7 +857,8 @@ pub async fn handle_match_command(
     }
     
     let role_ping = if !role_mentions.is_empty() {
-        format!("🗣️ {} A meeting time has been proposed! Please vote on your availability!", role_mentions.join(" "))
+        // More direct role ping format to ensure mentions trigger notifications
+        format!("{} 🗣️ A meeting time has been proposed! Please vote on your availability!", role_mentions.join(" "))
     } else {
         String::new()
     };
@@ -865,11 +866,17 @@ pub async fn handle_match_command(
     // Format the time slot buttons message
     let time_slot_message = format_time_slots(&active_poll);
     
-    // Edit the original response with time slot buttons
+    // Create a new message with role pings instead of editing to ensure mentions trigger properly
+    // Send the role pings in a separate message to ensure they trigger notifications
+    if !role_ping.is_empty() {
+        command.create_followup_message(&ctx.ctx.http, |m| {
+            m.content(&role_ping)
+        }).await?;
+    }
+    
+    // Then edit the original response with the voting UI
     let message = command.edit_original_interaction_response(&ctx.ctx.http, |m| {
-        if !role_ping.is_empty() {
-            m.content(&role_ping);
-        }
+        m.content("");
         
         m.embed(|e| {
             e.title(format!("Vote on Your Availability - Day {} of {}", 
@@ -892,7 +899,7 @@ pub async fn handle_match_command(
                         for slot in chunk {
                             row.create_button(|b| {
                                 b.custom_id(format!("slot_{}", slot.id))
-                                    .label(format!("{} (0)", &slot.formatted_time)) // Start with zero votes
+                                    .label(format!("{} [0]", &slot.formatted_time)) // Start with zero votes
                                     .style(serenity::model::application::component::ButtonStyle::Secondary)
                             });
                         }
@@ -1097,7 +1104,7 @@ fn format_time_slots(poll: &super::ActivePoll) -> String {
     // Time slots are now shown directly in the buttons
     
     // Add instructions
-    message.push_str("Click on a time to toggle your availability. Green buttons indicate times you've selected. The number in parentheses (0) shows how many people have selected that time.\n");
+    message.push_str("Click on a time to toggle your availability. Green buttons indicate times you've selected. The number in brackets [0] shows how many people have selected that time.\n");
     message.push_str("Use the navigation buttons to switch between days.\n");
     message.push_str("When you're done, click 'Submit Votes' to lock in your selections. If you don't select any times, you'll be marked as unavailable.\n\n");
     
@@ -2122,7 +2129,7 @@ async fn update_time_slot_message(
                                 
                             row.create_button(|b| {
                                 b.custom_id(format!("slot_{}", slot.id))
-                                    .label(format!("{} ({})", &slot.formatted_time, vote_count))
+                                    .label(format!("{} [{}]", &slot.formatted_time, vote_count))
                                     .style(if is_selected {
                                         serenity::model::application::component::ButtonStyle::Success // Green for selected
                                     } else {
@@ -2186,7 +2193,7 @@ fn find_optimal_meeting_slot(poll: &super::ActivePoll) -> Option<(usize, super::
     let mut slot_votes: HashMap<String, Vec<String>> = HashMap::new();
     
     // Get the set of users who submitted votes but selected nothing (marked as unavailable)
-    let unavailable_users: std::collections::HashSet<String> = poll.slot_responses.iter()
+    let _unavailable_users: std::collections::HashSet<String> = poll.slot_responses.iter()
         .filter(|(_, slots)| slots.is_empty())
         .map(|(user_id, _)| user_id.clone())
         .collect();
