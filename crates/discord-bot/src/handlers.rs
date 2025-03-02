@@ -17,6 +17,16 @@ use std::collections::HashMap;
 use tokio::sync::RwLock;
 use timesync_core::models::discord::MatchResult;
 
+/// Information about a time slot for voting
+#[derive(Debug, Clone)]
+pub struct SlotInfo {
+    pub id: String,           // Unique identifier for the slot
+    pub start: chrono::DateTime<chrono::Utc>,
+    pub end: chrono::DateTime<chrono::Utc>,
+    pub formatted_time: String, // Formatted time string (e.g., "6pm-7pm")
+    pub available_users: Vec<String>, // Discord IDs of users available at this time
+}
+
 pub mod schedule;
 
 use crate::config::BotConfig;
@@ -181,11 +191,16 @@ pub struct ActivePoll {
     pub group_names: Vec<String>,
     pub min_per_group: i64,
     pub required_yes_count: usize,
-    pub responses: HashMap<String, bool>, // user_id -> yes/no
+    pub responses: HashMap<String, bool>, // user_id -> yes/no (legacy)
+    pub slot_responses: HashMap<String, Vec<String>>, // user_id -> list of slot IDs they are available for
     pub db_pool: sqlx::PgPool,
     pub timezone: String,
     pub eligible_voters: String, // Comma-separated list of eligible voter IDs
     pub group_members: HashMap<uuid::Uuid, Vec<String>>, // group_id -> list of member IDs
+    pub slot_duration: i64, // Duration of each slot in minutes
+    pub display_days: i64, // Number of days to display (1-7)
+    pub current_day: usize, // Current day index being displayed
+    pub day_slots: HashMap<usize, Vec<SlotInfo>>, // Slots organized by day index
 }
 
 /// Shared context for command handlers.

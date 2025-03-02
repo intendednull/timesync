@@ -135,6 +135,20 @@ pub fn match_command() -> CreateApplicationCommand {
                 .description("Minimum number of users required from each group")
                 .kind(CommandOptionType::Integer)
                 .required(false)
+        })
+        .create_option(|option| {
+            option
+                .name("slot_duration")
+                .description("Duration of each time slot in minutes (default: 60)")
+                .kind(CommandOptionType::Integer)
+                .required(false)
+        })
+        .create_option(|option| {
+            option
+                .name("max_days")
+                .description("Maximum number of days to display (1-7, default: 7)")
+                .kind(CommandOptionType::Integer)
+                .required(false)
         });
     
     command

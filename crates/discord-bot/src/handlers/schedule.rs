@@ -644,6 +644,20 @@ pub async fn handle_match_command(
         .and_then(|opt| opt.value.as_ref())
         .and_then(|val| val.as_i64())
         .unwrap_or(1);
+        
+    // Get slot duration (default to 60 minutes)
+    let slot_duration = command.data.options.get(2)
+        .and_then(|opt| opt.value.as_ref())
+        .and_then(|val| val.as_i64())
+        .unwrap_or(60);
+        
+    // Get max days to display (default to 7, clamp between 1-7)
+    let display_days = command.data.options.get(3)
+        .and_then(|opt| opt.value.as_ref())
+        .and_then(|val| val.as_i64())
+        .unwrap_or(7)
+        .max(1)
+        .min(7);
     
     // Request a high number of matches to avoid running out
     let count = 50; // Set to a high value instead of using a parameter
@@ -801,22 +815,27 @@ pub async fn handle_match_command(
     // Store eligible voters as a comma-separated list of IDs
     let eligible_voters_str = eligible_voter_ids.into_iter().collect::<Vec<_>>().join(",");
     
-    // Create initial poll with first match
+    // Organize time slots by day
+    let day_slots = organize_slots_by_day(&match_response.matches, &timezone, slot_duration);
+    
+    // Create initial poll with the new time slot voting system
     let active_poll = super::ActivePoll {
         matches: match_response.matches.clone(),
         current_index: 0,
         group_names: group_names.clone(),
         min_per_group,
         required_yes_count,
-        responses: HashMap::new(),
+        responses: HashMap::new(), // Keep for backward compatibility
+        slot_responses: HashMap::new(), // New response format
         db_pool: ctx.db_pool.clone(),
-        timezone,
+        timezone: timezone.clone(),
         eligible_voters: eligible_voters_str.clone(),
         group_members,
+        slot_duration,
+        display_days,
+        current_day: 0, // Start with first day
+        day_slots,
     };
-    
-    // Create a formatted response with just the first match
-    let first_match_message = format_match_option(&active_poll, 0, required_yes_count);
     
     // Get role mentions for all groups
     let mut role_mentions = Vec::new();
@@ -838,40 +857,87 @@ pub async fn handle_match_command(
     }
     
     let role_ping = if !role_mentions.is_empty() {
-        format!("🗣️ {} A meeting time has been proposed! Please vote!", role_mentions.join(" "))
+        format!("🗣️ {} A meeting time has been proposed! Please vote on your availability!", role_mentions.join(" "))
     } else {
         String::new()
     };
     
-    // Edit the original response with the first match
+    // Format the time slot buttons message
+    let time_slot_message = format_time_slots(&active_poll);
+    
+    // Edit the original response with time slot buttons
     let message = command.edit_original_interaction_response(&ctx.ctx.http, |m| {
         if !role_ping.is_empty() {
             m.content(&role_ping);
         }
         
         m.embed(|e| {
-            e.title(format!("Proposed Meeting Time (1 of {})", match_response.matches.len()))
-                .description(&first_match_message)
+            e.title(format!("Vote on Your Availability - Day {} of {}", 
+                          active_poll.current_day + 1, 
+                          active_poll.day_slots.len()))
+                .description(&time_slot_message)
                 .color(Color::GOLD)
                 .footer(|f| f.text(format!(
-                    "Min members per group: {} • {}/{} yes votes needed • Generated at: {}",
+                    "Min members per group: {} • Slot duration: {} min • Timezone: {}",
                     min_per_group,
-                    0,
-                    required_yes_count,
-                    Utc::now().format("%Y-%m-%d %H:%M UTC")
+                    slot_duration,
+                    timezone
                 )))
         })
         .components(|c| {
+            // Add time slot selection buttons
+            if let Some(slots) = active_poll.day_slots.get(&active_poll.current_day) {
+                for chunk in slots.chunks(5) {
+                    c.create_action_row(|row| {
+                        for slot in chunk {
+                            row.create_button(|b| {
+                                b.custom_id(format!("slot_{}", slot.id))
+                                    .label(&slot.formatted_time)
+                                    .style(serenity::model::application::component::ButtonStyle::Secondary)
+                            });
+                        }
+                        row
+                    });
+                }
+            }
+            
+            // Add navigation and utility buttons
+            c.create_action_row(|row| {
+                // Previous day button
+                row.create_button(|b| {
+                    b.custom_id("prev_day")
+                        .label("◀️ Previous Day")
+                        .style(serenity::model::application::component::ButtonStyle::Primary)
+                        .disabled(active_poll.current_day == 0)
+                });
+                
+                // Next day button
+                row.create_button(|b| {
+                    b.custom_id("next_day")
+                        .label("Next Day ▶️")
+                        .style(serenity::model::application::component::ButtonStyle::Primary)
+                        .disabled(active_poll.current_day == active_poll.day_slots.len() - 1)
+                });
+                
+                row
+            });
+            
+            // Add select all / clear buttons
             c.create_action_row(|row| {
                 row.create_button(|b| {
-                    b.custom_id("match_yes")
-                        .label("Yes")
+                    b.custom_id("select_all")
+                        .label("Select All")
                         .style(serenity::model::application::component::ButtonStyle::Success)
                 })
                 .create_button(|b| {
-                    b.custom_id("match_no")
-                        .label("No")
+                    b.custom_id("clear_all")
+                        .label("Clear All")
                         .style(serenity::model::application::component::ButtonStyle::Danger)
+                })
+                .create_button(|b| {
+                    b.custom_id("finish_voting")
+                        .label("Finish Voting")
+                        .style(serenity::model::application::component::ButtonStyle::Primary)
                 })
             })
         })
@@ -886,6 +952,125 @@ pub async fn handle_match_command(
     Ok(())
 }
 
+/// Organize time slots by day
+fn organize_slots_by_day(
+    matches: &[MatchResult], 
+    timezone_str: &str, 
+    slot_duration: i64
+) -> HashMap<usize, Vec<super::SlotInfo>> {
+    let mut day_slots = HashMap::new();
+    let tz = chrono_tz::Tz::from_str(timezone_str).unwrap_or(chrono_tz::UTC);
+    
+    // Convert all match times to slots
+    for (match_idx, match_result) in matches.iter().enumerate() {
+        // Convert to local timezone for display
+        let start_local = match_result.start.with_timezone(&tz);
+        let end_local = match_result.end.with_timezone(&tz);
+        
+        // Calculate day index (days since epoch for the start date)
+        let day_idx = start_local.date_naive().num_days_from_ce() as usize;
+        
+        // Create time chunks for this match based on slot_duration
+        let mut current_time = match_result.start;
+        let match_end = match_result.end;
+        
+        let duration_chunk = chrono::Duration::minutes(slot_duration);
+        
+        while current_time < match_end {
+            let chunk_end = std::cmp::min(current_time + duration_chunk, match_end);
+            
+            // Format the time for display
+            let start_local = current_time.with_timezone(&tz);
+            let end_local = chunk_end.with_timezone(&tz);
+            
+            let formatted_time = format!(
+                "{}-{}", 
+                start_local.format("%I:%M%p"), 
+                end_local.format("%I:%M%p")
+            ).replace("AM", "am").replace("PM", "pm");
+            
+            // Create a unique ID for this slot
+            let slot_id = format!("{}_{}", match_idx, current_time.timestamp());
+            
+            // Create the slot info
+            let slot = super::SlotInfo {
+                id: slot_id,
+                start: current_time,
+                end: chunk_end,
+                formatted_time,
+                available_users: match_result.groups.iter()
+                    .flat_map(|g| g.available_users.clone())
+                    .collect(),
+            };
+            
+            // Add to the day's slots
+            day_slots.entry(day_idx).or_insert_with(Vec::new).push(slot);
+            
+            // Move to next chunk
+            current_time = chunk_end;
+        }
+    }
+    
+    // Sort slots within each day by start time
+    for slots in day_slots.values_mut() {
+        slots.sort_by_key(|slot| slot.start);
+    }
+    
+    // Remap the days to be 0-indexed in chronological order
+    let day_indices: Vec<usize> = day_slots.keys().cloned().collect();
+    if !day_indices.is_empty() {
+        let mut remapped_slots = HashMap::new();
+        let mut sorted_days: Vec<usize> = day_indices.clone();
+        sorted_days.sort();
+        
+        for (i, day) in sorted_days.iter().enumerate() {
+            if let Some(slots) = day_slots.remove(day) {
+                remapped_slots.insert(i, slots);
+            }
+        }
+        
+        return remapped_slots;
+    }
+    
+    day_slots
+}
+
+/// Format time slots for display in the message
+fn format_time_slots(poll: &super::ActivePoll) -> String {
+    // Get the current day's date
+    let current_day_slots = match poll.day_slots.get(&poll.current_day) {
+        Some(slots) => slots,
+        None => return "No time slots available for this day.".to_string(),
+    };
+    
+    if current_day_slots.is_empty() {
+        return "No time slots available for this day.".to_string();
+    }
+    
+    // Get the date from the first slot's start time
+    let tz = chrono_tz::Tz::from_str(&poll.timezone).unwrap_or(chrono_tz::UTC);
+    let day_date = current_day_slots[0].start.with_timezone(&tz).format("%A, %B %d, %Y").to_string();
+    
+    let mut message = format!("**{}**\n\nSelect all time slots when you are available:\n\n", day_date);
+    
+    // Count how many people have voted
+    let voted_users: std::collections::HashSet<&String> = poll.slot_responses.keys().collect();
+    
+    // Add information about who has voted
+    message.push_str(&format!("**{} of {} members have voted**\n\n", 
+        voted_users.len(), 
+        poll.eligible_voters.split(',').filter(|s| !s.is_empty()).count()
+    ));
+    
+    // Add instructions
+    message.push_str("Click on a time to toggle your availability. Blue buttons indicate times you've selected.\n");
+    message.push_str("Use the navigation buttons to switch between days.\n");
+    message.push_str("When you're done, click 'Finish Voting' to submit your availability.\n\n");
+    
+    message
+}
+}
+
 /// Handle button interactions for scheduling matches
 pub async fn handle_component_interaction(
     ctx: HandlerContext,
@@ -894,8 +1079,20 @@ pub async fn handle_component_interaction(
     let custom_id = &component.data.custom_id;
     
     match custom_id.as_str() {
+        // Legacy handlers
         "match_yes" | "match_no" => handle_match_vote(ctx, component, custom_id == "match_yes").await,
         "match_confirm" => handle_match_confirm(ctx, component).await,
+        
+        // New time slot voting handlers
+        "prev_day" => handle_prev_day(ctx, component).await,
+        "next_day" => handle_next_day(ctx, component).await,
+        "select_all" => handle_select_all_slots(ctx, component).await,
+        "clear_all" => handle_clear_all_slots(ctx, component).await,
+        "finish_voting" => handle_finish_voting(ctx, component).await,
+        _ if custom_id.starts_with("slot_") => {
+            let slot_id = custom_id.strip_prefix("slot_").unwrap_or("");
+            handle_slot_toggle(ctx, component, slot_id).await
+        },
         _ => Ok(()),
     }
 }
@@ -1269,6 +1466,527 @@ async fn handle_match_confirm(
     }).await?;
     
     Ok(())
+}
+
+/// Handle "Previous Day" button click
+async fn handle_prev_day(
+    ctx: HandlerContext,
+    component: &mut MessageComponentInteraction,
+) -> Result<()> {
+    // Get the poll associated with this message
+    let mut polls = ctx.active_polls.write().await;
+    let poll = polls.get_mut(&component.message.id)
+        .ok_or_else(|| eyre::eyre!("No active poll found for this message"))?;
+    
+    // Verify we're not already on the first day
+    if poll.current_day == 0 {
+        // Already on first day, just acknowledge the interaction
+        component.create_interaction_response(&ctx.ctx.http, |r| {
+            r.kind(InteractionResponseType::DeferredUpdateMessage)
+        }).await?;
+        
+        return Ok(());
+    }
+    
+    // Go to previous day
+    poll.current_day -= 1;
+    
+    // Update the message
+    update_time_slot_message(ctx.clone(), component, poll).await?;
+    
+    Ok(())
+}
+
+/// Handle "Next Day" button click
+async fn handle_next_day(
+    ctx: HandlerContext,
+    component: &mut MessageComponentInteraction,
+) -> Result<()> {
+    // Get the poll associated with this message
+    let mut polls = ctx.active_polls.write().await;
+    let poll = polls.get_mut(&component.message.id)
+        .ok_or_else(|| eyre::eyre!("No active poll found for this message"))?;
+    
+    // Verify we're not already on the last day
+    if poll.current_day >= poll.day_slots.len() - 1 {
+        // Already on last day, just acknowledge the interaction
+        component.create_interaction_response(&ctx.ctx.http, |r| {
+            r.kind(InteractionResponseType::DeferredUpdateMessage)
+        }).await?;
+        
+        return Ok(());
+    }
+    
+    // Go to next day
+    poll.current_day += 1;
+    
+    // Update the message
+    update_time_slot_message(ctx.clone(), component, poll).await?;
+    
+    Ok(())
+}
+
+/// Handle time slot toggle button click
+async fn handle_slot_toggle(
+    ctx: HandlerContext,
+    component: &mut MessageComponentInteraction,
+    slot_id: &str,
+) -> Result<()> {
+    // Get the voter ID
+    let voter_id = component.user.id.to_string();
+    
+    // Get the poll associated with this message
+    let mut polls = ctx.active_polls.write().await;
+    let poll = polls.get_mut(&component.message.id)
+        .ok_or_else(|| eyre::eyre!("No active poll found for this message"))?;
+    
+    // Check if the user is an eligible voter (member of one of the selected groups)
+    let eligible_voters: Vec<String> = if poll.eligible_voters.is_empty() {
+        Vec::new()
+    } else {
+        poll.eligible_voters.split(',').map(|s| s.to_string()).collect()
+    };
+    
+    if !eligible_voters.contains(&voter_id) {
+        // Acknowledge the interaction
+        component.create_interaction_response(&ctx.ctx.http, |r| {
+            r.kind(InteractionResponseType::ChannelMessageWithSource)
+                .interaction_response_data(|m| {
+                    m.content("You are not a member of any of the groups in this poll, so you cannot vote.")
+                        .ephemeral(true)
+                })
+        }).await?;
+        
+        return Ok(());
+    }
+    
+    // Toggle this slot for the user
+    let user_slots = poll.slot_responses.entry(voter_id.clone()).or_insert_with(Vec::new);
+    
+    // Check if the user already has this slot selected
+    if let Some(index) = user_slots.iter().position(|s| s == slot_id) {
+        // Remove the slot (deselect)
+        user_slots.remove(index);
+    } else {
+        // Add the slot (select)
+        user_slots.push(slot_id.to_string());
+    }
+    
+    // Update the message
+    update_time_slot_message(ctx.clone(), component, poll).await?;
+    
+    Ok(())
+}
+
+/// Handle "Select All" button click
+async fn handle_select_all_slots(
+    ctx: HandlerContext,
+    component: &mut MessageComponentInteraction,
+) -> Result<()> {
+    // Get the voter ID
+    let voter_id = component.user.id.to_string();
+    
+    // Get the poll associated with this message
+    let mut polls = ctx.active_polls.write().await;
+    let poll = polls.get_mut(&component.message.id)
+        .ok_or_else(|| eyre::eyre!("No active poll found for this message"))?;
+    
+    // Check if the user is an eligible voter (member of one of the selected groups)
+    let eligible_voters: Vec<String> = if poll.eligible_voters.is_empty() {
+        Vec::new()
+    } else {
+        poll.eligible_voters.split(',').map(|s| s.to_string()).collect()
+    };
+    
+    if !eligible_voters.contains(&voter_id) {
+        // Acknowledge the interaction
+        component.create_interaction_response(&ctx.ctx.http, |r| {
+            r.kind(InteractionResponseType::ChannelMessageWithSource)
+                .interaction_response_data(|m| {
+                    m.content("You are not a member of any of the groups in this poll, so you cannot vote.")
+                        .ephemeral(true)
+                })
+        }).await?;
+        
+        return Ok(());
+    }
+    
+    // Get all slot IDs for the current day
+    let current_day_slots = match poll.day_slots.get(&poll.current_day) {
+        Some(slots) => slots,
+        None => {
+            // No slots for this day, just acknowledge the interaction
+            component.create_interaction_response(&ctx.ctx.http, |r| {
+                r.kind(InteractionResponseType::DeferredUpdateMessage)
+            }).await?;
+            
+            return Ok(());
+        }
+    };
+    
+    // Select all slots for this day
+    let user_slots = poll.slot_responses.entry(voter_id.clone()).or_insert_with(Vec::new);
+    
+    // Add all slots from the current day that aren't already selected
+    for slot in current_day_slots {
+        if !user_slots.contains(&slot.id) {
+            user_slots.push(slot.id.clone());
+        }
+    }
+    
+    // Update the message
+    update_time_slot_message(ctx.clone(), component, poll).await?;
+    
+    Ok(())
+}
+
+/// Handle "Clear All" button click
+async fn handle_clear_all_slots(
+    ctx: HandlerContext,
+    component: &mut MessageComponentInteraction,
+) -> Result<()> {
+    // Get the voter ID
+    let voter_id = component.user.id.to_string();
+    
+    // Get the poll associated with this message
+    let mut polls = ctx.active_polls.write().await;
+    let poll = polls.get_mut(&component.message.id)
+        .ok_or_else(|| eyre::eyre!("No active poll found for this message"))?;
+    
+    // Check if the user is an eligible voter (member of one of the selected groups)
+    let eligible_voters: Vec<String> = if poll.eligible_voters.is_empty() {
+        Vec::new()
+    } else {
+        poll.eligible_voters.split(',').map(|s| s.to_string()).collect()
+    };
+    
+    if !eligible_voters.contains(&voter_id) {
+        // Acknowledge the interaction
+        component.create_interaction_response(&ctx.ctx.http, |r| {
+            r.kind(InteractionResponseType::ChannelMessageWithSource)
+                .interaction_response_data(|m| {
+                    m.content("You are not a member of any of the groups in this poll, so you cannot vote.")
+                        .ephemeral(true)
+                })
+        }).await?;
+        
+        return Ok(());
+    }
+    
+    // Get all slot IDs for the current day
+    let current_day_slots = match poll.day_slots.get(&poll.current_day) {
+        Some(slots) => slots,
+        None => {
+            // No slots for this day, just acknowledge the interaction
+            component.create_interaction_response(&ctx.ctx.http, |r| {
+                r.kind(InteractionResponseType::DeferredUpdateMessage)
+            }).await?;
+            
+            return Ok(());
+        }
+    };
+    
+    // Clear all slots for this day
+    let user_slots = poll.slot_responses.entry(voter_id.clone()).or_insert_with(Vec::new);
+    
+    // Remove all slots from the current day
+    for slot in current_day_slots {
+        if let Some(index) = user_slots.iter().position(|s| s == &slot.id) {
+            user_slots.remove(index);
+        }
+    }
+    
+    // Update the message
+    update_time_slot_message(ctx.clone(), component, poll).await?;
+    
+    Ok(())
+}
+
+/// Handle "Finish Voting" button click
+async fn handle_finish_voting(
+    ctx: HandlerContext,
+    component: &mut MessageComponentInteraction,
+) -> Result<()> {
+    // Get the voter ID
+    let voter_id = component.user.id.to_string();
+    
+    // Get the poll associated with this message
+    let mut polls = ctx.active_polls.write().await;
+    let poll = polls.get_mut(&component.message.id)
+        .ok_or_else(|| eyre::eyre!("No active poll found for this message"))?;
+    
+    // Check if the user is an eligible voter (member of one of the selected groups)
+    let eligible_voters: Vec<String> = if poll.eligible_voters.is_empty() {
+        Vec::new()
+    } else {
+        poll.eligible_voters.split(',').map(|s| s.to_string()).collect()
+    };
+    
+    if !eligible_voters.contains(&voter_id) {
+        // Acknowledge the interaction
+        component.create_interaction_response(&ctx.ctx.http, |r| {
+            r.kind(InteractionResponseType::ChannelMessageWithSource)
+                .interaction_response_data(|m| {
+                    m.content("You are not a member of any of the groups in this poll, so you cannot vote.")
+                        .ephemeral(true)
+                })
+        }).await?;
+        
+        return Ok(());
+    }
+    
+    // Acknowledge the interaction first
+    component.create_interaction_response(&ctx.ctx.http, |r| {
+        r.kind(InteractionResponseType::DeferredUpdateMessage)
+    }).await?;
+    
+    // Calculate the optimal meeting time based on votes
+    let optimal_slot = find_optimal_meeting_slot(poll);
+    
+    if let Some((day_idx, slot_info, attending_users)) = optimal_slot {
+        // We found a good meeting time
+        // Format date for display
+        let tz = chrono_tz::Tz::from_str(&poll.timezone).unwrap_or(chrono_tz::UTC);
+        let day_date = slot_info.start.with_timezone(&tz).format("%A, %B %d, %Y").to_string();
+        
+        // Create description for the message
+        let mut description = format!(
+            "**Meeting Time Found!**\n\n**{}**\n**{}**\n\n",
+            day_date,
+            slot_info.formatted_time
+        );
+        
+        // List attending users
+        description.push_str("**Attending:**\n");
+        for user_id in &attending_users {
+            description.push_str(&format!("• <@{}>\n", user_id));
+        }
+        
+        // Get role IDs for all groups to ping during announcement
+        let mut role_mentions = Vec::new();
+        for group_name in &poll.group_names {
+            // Query to get the role ID for this group
+            let role_query = sqlx::query(
+                "SELECT role_id FROM discord_groups WHERE name = $1 AND server_id = $2"
+            )
+            .bind(group_name)
+            .bind(component.guild_id.unwrap().to_string())
+            .fetch_optional(&ctx.db_pool)
+            .await;
+            
+            if let Ok(Some(row)) = role_query {
+                if let Ok(Some(id)) = row.try_get::<Option<String>, _>("role_id") {
+                    role_mentions.push(format!("<@&{}>", id));
+                }
+            }
+        }
+        
+        // Create ping message for attendees and roles
+        let ping_message = {
+            let mut message = "🔔 Meeting confirmed! ".to_string();
+            
+            // Add role pings
+            if !role_mentions.is_empty() {
+                message.push_str(&format!("{} ", role_mentions.join(" ")));
+            }
+            
+            // Add individual attendee pings
+            if !attending_users.is_empty() {
+                message.push_str("- Please mark your calendars!");
+            } else {
+                message.push_str("Please mark your calendars!");
+            }
+            
+            message
+        };
+        
+        // Update the message to show the confirmation
+        component.message.edit(&ctx.ctx.http, |m| {
+            m.content(&ping_message)
+                .embed(|e| {
+                    e.title("Meeting Time Confirmed!")
+                        .description(description)
+                        .color(Color::DARK_GREEN)
+                        .footer(|f| f.text(format!(
+                            "Min members per group: {} • {} attendees • Timezone: {}",
+                            poll.min_per_group,
+                            attending_users.len(),
+                            poll.timezone
+                        )))
+                })
+                .components(|c| c) // Clear components
+        }).await?;
+        
+        // Remove the poll from active polls
+        polls.remove(&component.message.id);
+    } else {
+        // No suitable meeting time found
+        component.message.edit(&ctx.ctx.http, |m| {
+            m.content("❌ No suitable meeting time could be found. Consider trying with different groups or ask members to update their availability.")
+                .embed(|e| {
+                    e.title("No Suitable Meeting Time Found")
+                        .description("We could not find a meeting time where enough members from each group are available. You may want to try again with different parameters.")
+                        .color(Color::RED)
+                })
+                .components(|c| c) // Clear components
+        }).await?;
+        
+        // Remove the poll from active polls
+        polls.remove(&component.message.id);
+    }
+    
+    Ok(())
+}
+
+/// Update the time slot message UI
+async fn update_time_slot_message(
+    ctx: HandlerContext,
+    component: &mut MessageComponentInteraction,
+    poll: &super::ActivePoll,
+) -> Result<()> {
+    // Format the time slot message
+    let time_slot_message = format_time_slots(poll);
+    
+    // Get the user's selected slots
+    let voter_id = component.user.id.to_string();
+    let user_selected_slots = poll.slot_responses.get(&voter_id).cloned().unwrap_or_default();
+    
+    // Update the message with the new day's slots and highlight selected ones
+    component.create_interaction_response(&ctx.ctx.http, |r| {
+        r.kind(InteractionResponseType::UpdateMessage)
+            .interaction_response_data(|m| {
+                m.embed(|e| {
+                    e.title(format!("Vote on Your Availability - Day {} of {}", 
+                                  poll.current_day + 1, 
+                                  poll.day_slots.len()))
+                        .description(&time_slot_message)
+                        .color(Color::GOLD)
+                        .footer(|f| f.text(format!(
+                            "Min members per group: {} • Slot duration: {} min • Timezone: {}",
+                            poll.min_per_group,
+                            poll.slot_duration,
+                            poll.timezone
+                        )))
+                })
+                .components(|c| {
+                    // Add time slot selection buttons
+                    if let Some(slots) = poll.day_slots.get(&poll.current_day) {
+                        for chunk in slots.chunks(5) {
+                            c.create_action_row(|row| {
+                                for slot in chunk {
+                                    // Check if this slot is selected by the current user
+                                    let is_selected = user_selected_slots.contains(&slot.id);
+                                    
+                                    row.create_button(|b| {
+                                        b.custom_id(format!("slot_{}", slot.id))
+                                            .label(&slot.formatted_time)
+                                            .style(if is_selected {
+                                                serenity::model::application::component::ButtonStyle::Primary
+                                            } else {
+                                                serenity::model::application::component::ButtonStyle::Secondary
+                                            })
+                                    });
+                                }
+                                row
+                            });
+                        }
+                    }
+                    
+                    // Add navigation and utility buttons
+                    c.create_action_row(|row| {
+                        // Previous day button
+                        row.create_button(|b| {
+                            b.custom_id("prev_day")
+                                .label("◀️ Previous Day")
+                                .style(serenity::model::application::component::ButtonStyle::Primary)
+                                .disabled(poll.current_day == 0)
+                        });
+                        
+                        // Next day button
+                        row.create_button(|b| {
+                            b.custom_id("next_day")
+                                .label("Next Day ▶️")
+                                .style(serenity::model::application::component::ButtonStyle::Primary)
+                                .disabled(poll.current_day >= poll.day_slots.len() - 1)
+                        });
+                        
+                        row
+                    });
+                    
+                    // Add select all / clear buttons
+                    c.create_action_row(|row| {
+                        row.create_button(|b| {
+                            b.custom_id("select_all")
+                                .label("Select All")
+                                .style(serenity::model::application::component::ButtonStyle::Success)
+                        })
+                        .create_button(|b| {
+                            b.custom_id("clear_all")
+                                .label("Clear All")
+                                .style(serenity::model::application::component::ButtonStyle::Danger)
+                        })
+                        .create_button(|b| {
+                            b.custom_id("finish_voting")
+                                .label("Finish Voting")
+                                .style(serenity::model::application::component::ButtonStyle::Primary)
+                        })
+                    })
+                })
+            })
+    }).await?;
+    
+    Ok(())
+}
+
+/// Find the optimal meeting slot based on votes
+fn find_optimal_meeting_slot(poll: &super::ActivePoll) -> Option<(usize, super::SlotInfo, Vec<String>)> {
+    // A map to track votes for each slot
+    let mut slot_votes: HashMap<String, Vec<String>> = HashMap::new();
+    
+    // Collect all votes
+    for (user_id, selected_slots) in &poll.slot_responses {
+        for slot_id in selected_slots {
+            slot_votes.entry(slot_id.clone())
+                .or_insert_with(Vec::new)
+                .push(user_id.clone());
+        }
+    }
+    
+    // Now find the best slot by day
+    let mut best_slot: Option<(usize, super::SlotInfo, Vec<String>)> = None;
+    let mut max_votes = 0;
+    
+    // Check each day
+    for (day_idx, slots) in &poll.day_slots {
+        for slot in slots {
+            let voters = slot_votes.get(&slot.id).cloned().unwrap_or_default();
+            let vote_count = voters.len();
+            
+            // Check if this slot meets the minimum requirements for each group
+            let mut group_counts: HashMap<uuid::Uuid, usize> = HashMap::new();
+            
+            for (group_id, members) in &poll.group_members {
+                let group_vote_count = members.iter()
+                    .filter(|member_id| voters.contains(member_id))
+                    .count();
+                
+                group_counts.insert(*group_id, group_vote_count);
+            }
+            
+            // Check if all groups meet minimum requirement
+            let all_groups_meet_min = group_counts.iter()
+                .all(|(_, &count)| count >= poll.min_per_group as usize);
+            
+            // Update best slot if this one is better
+            if all_groups_meet_min && vote_count > max_votes {
+                max_votes = vote_count;
+                best_slot = Some((*day_idx, slot.clone(), voters));
+            }
+        }
+    }
+    
+    best_slot
+}
 }
 
 /// Format a single match option for display
