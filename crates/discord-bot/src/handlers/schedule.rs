@@ -1062,14 +1062,58 @@ fn format_time_slots(poll: &super::ActivePoll) -> String {
     
     let mut message = format!("**{}**\n\nSelect all time slots when you are available:\n\n", day_date);
     
-    // Count how many people have voted
+    // Get all users who have submitted votes
     let voted_users: std::collections::HashSet<&String> = poll.slot_responses.keys().collect();
+    let total_eligible = poll.eligible_voters.split(',').filter(|s| !s.is_empty()).count();
     
-    // Add information about who has voted
-    message.push_str(&format!("**{} of {} members have voted**\n\n", 
+    // Create a voting progress report by group
+    message.push_str("**Voting Progress:**\n");
+    
+    // Calculate votes by group to show progress
+    for (idx, (_group_id, members)) in poll.group_members.iter().enumerate() {
+        // Try to get the group name if available (using the index as a best effort)
+        let group_name = poll.group_names.get(idx)
+            .unwrap_or(&format!("Group {}", idx + 1))
+            .clone();
+            
+        let min_required = poll.min_per_group as usize;
+        let voted_count = members.iter().filter(|m| voted_users.contains(m)).count();
+        let total_count = members.len();
+        
+        message.push_str(&format!(
+            "• **{}**: {}/{} members voted (min required: {})\n",
+            group_name,
+            voted_count,
+            total_count,
+            min_required
+        ));
+    }
+    
+    message.push_str(&format!("\n**Total: {} of {} members have voted**\n\n", 
         voted_users.len(), 
-        poll.eligible_voters.split(',').filter(|s| !s.is_empty()).count()
+        total_eligible
     ));
+    
+    // Count votes for each time slot on current day
+    let mut slot_vote_counts = HashMap::new();
+    for (_user_id, selected_slots) in &poll.slot_responses {
+        for slot_id in selected_slots {
+            *slot_vote_counts.entry(slot_id).or_insert(0) += 1;
+        }
+    }
+    
+    // Display available time slots with vote counts
+    message.push_str("**Available Time Slots:**\n");
+    for slot in current_day_slots {
+        let votes = slot_vote_counts.get(&slot.id).cloned().unwrap_or(0);
+        
+        message.push_str(&format!(
+            "• **{}** - {} people have voted for this slot\n",
+            slot.formatted_time,
+            votes
+        ));
+    }
+    message.push_str("\n");
     
     // Add instructions
     message.push_str("Click on a time to toggle your availability. Blue buttons indicate times you've selected.\n");
@@ -1139,10 +1183,10 @@ async fn handle_match_vote(
         return Ok(());
     }
     
-    // Acknowledge the interaction
-    component.create_interaction_response(&ctx.ctx.http, |r| {
+    // Acknowledge the interaction - ignore errors in case already acknowledged
+    let _ = component.create_interaction_response(&ctx.ctx.http, |r| {
         r.kind(InteractionResponseType::DeferredUpdateMessage)
-    }).await?;
+    }).await;
     
     // Record the user's response
     poll.responses.insert(voter_id, is_yes);
@@ -1489,9 +1533,10 @@ async fn handle_prev_day(
     // Verify we're not already on the first day
     if poll.current_day == 0 {
         // Already on first day, just acknowledge the interaction
-        component.create_interaction_response(&ctx.ctx.http, |r| {
+        // Ignore errors in case it's already acknowledged
+        let _ = component.create_interaction_response(&ctx.ctx.http, |r| {
             r.kind(InteractionResponseType::DeferredUpdateMessage)
-        }).await?;
+        }).await;
         
         return Ok(());
     }
@@ -1499,8 +1544,12 @@ async fn handle_prev_day(
     // Go to previous day
     poll.current_day -= 1;
     
-    // Update the message
-    update_time_slot_message(ctx.clone(), component, poll).await?;
+    // Get a clone of the poll before releasing the lock
+    let poll_clone = poll.clone();
+    drop(polls);
+    
+    // Update the message with the cloned data
+    update_time_slot_message(ctx, component, &poll_clone).await?;
     
     Ok(())
 }
@@ -1518,9 +1567,10 @@ async fn handle_next_day(
     // Verify we're not already on the last day
     if poll.current_day >= poll.day_slots.len() - 1 {
         // Already on last day, just acknowledge the interaction
-        component.create_interaction_response(&ctx.ctx.http, |r| {
+        // Ignore errors in case it's already acknowledged
+        let _ = component.create_interaction_response(&ctx.ctx.http, |r| {
             r.kind(InteractionResponseType::DeferredUpdateMessage)
-        }).await?;
+        }).await;
         
         return Ok(());
     }
@@ -1528,8 +1578,12 @@ async fn handle_next_day(
     // Go to next day
     poll.current_day += 1;
     
-    // Update the message
-    update_time_slot_message(ctx.clone(), component, poll).await?;
+    // Get a clone of the poll before releasing the lock
+    let poll_clone = poll.clone();
+    drop(polls);
+    
+    // Update the message with the cloned data
+    update_time_slot_message(ctx, component, &poll_clone).await?;
     
     Ok(())
 }
@@ -1568,10 +1622,16 @@ async fn handle_slot_toggle(
         return Ok(());
     }
     
+    // Acknowledge the interaction first, before making any changes
+    // If it fails (already acknowledged), that's ok - we'll just update the message directly
+    let _ = component.create_interaction_response(&ctx.ctx.http, |r| {
+        r.kind(InteractionResponseType::DeferredUpdateMessage)
+    }).await;
+    
     // Toggle this slot for the user
     let user_slots = poll.slot_responses.entry(voter_id.clone()).or_insert_with(Vec::new);
     
-    // Check if the user already has this slot selected
+    // Toggle - if slot is already selected, remove it; otherwise add it
     if let Some(index) = user_slots.iter().position(|s| s == slot_id) {
         // Remove the slot (deselect)
         user_slots.remove(index);
@@ -1580,8 +1640,12 @@ async fn handle_slot_toggle(
         user_slots.push(slot_id.to_string());
     }
     
-    // Update the message
-    update_time_slot_message(ctx.clone(), component, poll).await?;
+    // Get a clone of the poll before releasing the lock
+    let poll_clone = poll.clone();
+    drop(polls);
+    
+    // Update the message with the cloned data
+    update_time_slot_message(ctx, component, &poll_clone).await?;
     
     Ok(())
 }
@@ -1624,9 +1688,10 @@ async fn handle_select_all_slots(
         Some(slots) => slots,
         None => {
             // No slots for this day, just acknowledge the interaction
-            component.create_interaction_response(&ctx.ctx.http, |r| {
+            // Ignore errors in case it's already acknowledged
+            let _ = component.create_interaction_response(&ctx.ctx.http, |r| {
                 r.kind(InteractionResponseType::DeferredUpdateMessage)
-            }).await?;
+            }).await;
             
             return Ok(());
         }
@@ -1642,8 +1707,12 @@ async fn handle_select_all_slots(
         }
     }
     
-    // Update the message
-    update_time_slot_message(ctx.clone(), component, poll).await?;
+    // Get a clone of the poll before releasing the lock
+    let poll_clone = poll.clone();
+    drop(polls);
+    
+    // Update the message with the cloned data
+    update_time_slot_message(ctx, component, &poll_clone).await?;
     
     Ok(())
 }
@@ -1686,9 +1755,10 @@ async fn handle_clear_all_slots(
         Some(slots) => slots,
         None => {
             // No slots for this day, just acknowledge the interaction
-            component.create_interaction_response(&ctx.ctx.http, |r| {
+            // Ignore errors in case it's already acknowledged
+            let _ = component.create_interaction_response(&ctx.ctx.http, |r| {
                 r.kind(InteractionResponseType::DeferredUpdateMessage)
-            }).await?;
+            }).await;
             
             return Ok(());
         }
@@ -1704,8 +1774,12 @@ async fn handle_clear_all_slots(
         }
     }
     
-    // Update the message
-    update_time_slot_message(ctx.clone(), component, poll).await?;
+    // Get a clone of the poll before releasing the lock
+    let poll_clone = poll.clone();
+    drop(polls);
+    
+    // Update the message with the cloned data
+    update_time_slot_message(ctx, component, &poll_clone).await?;
     
     Ok(())
 }
@@ -1743,104 +1817,256 @@ async fn handle_finish_voting(
         return Ok(());
     }
     
-    // Acknowledge the interaction first
-    component.create_interaction_response(&ctx.ctx.http, |r| {
+    // Acknowledge the interaction first - this should be done before any processing
+    let _ = component.create_interaction_response(&ctx.ctx.http, |r| {
         r.kind(InteractionResponseType::DeferredUpdateMessage)
-    }).await?;
+    }).await;
+    // Note: We use let _ to ignore errors, in case the interaction was already acknowledged
     
-    // Calculate the optimal meeting time based on votes
-    let optimal_slot = find_optimal_meeting_slot(poll);
+    // Get users who have voted
+    let voted_users: std::collections::HashSet<String> = poll.slot_responses.keys().cloned().collect();
     
-    if let Some((_day_idx, slot_info, attending_users)) = optimal_slot {
-        // We found a good meeting time
-        // Format date for display
-        let tz = chrono_tz::Tz::from_str(&poll.timezone).unwrap_or(chrono_tz::UTC);
-        let day_date = slot_info.start.with_timezone(&tz).format("%A, %B %d, %Y").to_string();
+    // Check if we've reached completion criteria:
+    // 1. Have all required members voted? 
+    // 2. Or do we have enough votes to know the outcome?
+    let mut voting_complete = true;
+    let mut min_requirements_possible = true;
+    let mut groups_status = Vec::new();
+    
+    for (idx, (_group_id, members)) in poll.group_members.iter().enumerate() {
+        let min_required = poll.min_per_group as usize;
+        let voted_count = members.iter().filter(|m| voted_users.contains(*m)).count();
+        let remaining_count = members.len() - voted_count;
         
-        // Create description for the message
-        let mut description = format!(
-            "**Meeting Time Found!**\n\n**{}**\n**{}**\n\n",
-            day_date,
-            slot_info.formatted_time
-        );
+        // Keep track of the group's status for the message
+        let group_name = poll.group_names.get(idx)
+            .unwrap_or(&format!("Group {}", idx + 1))
+            .clone();
         
-        // List attending users
-        description.push_str("**Attending:**\n");
-        for user_id in &attending_users {
-            description.push_str(&format!("• <@{}>\n", user_id));
-        }
+        // Is it still possible to reach the minimum required members?
+        let available_votes = voted_count + remaining_count;
         
-        // Get role IDs for all groups to ping during announcement
-        let mut role_mentions = Vec::new();
-        for group_name in &poll.group_names {
-            // Query to get the role ID for this group
-            let role_query = sqlx::query(
-                "SELECT role_id FROM discord_groups WHERE name = $1 AND server_id = $2"
-            )
-            .bind(group_name)
-            .bind(component.guild_id.unwrap().to_string())
-            .fetch_optional(&ctx.db_pool)
-            .await;
+        // If we can't reach the minimum requirement even if everyone else votes,
+        // then voting is effectively complete and we know the result will be negative
+        if available_votes < min_required {
+            min_requirements_possible = false;
+            groups_status.push((group_name, voted_count, min_required, false));
+        } else {
+            // Otherwise, check if we've met the minimum already
+            let min_met = voted_count >= min_required;
+            groups_status.push((group_name, voted_count, min_required, min_met));
             
-            if let Ok(Some(row)) = role_query {
-                if let Ok(Some(id)) = row.try_get::<Option<String>, _>("role_id") {
-                    role_mentions.push(format!("<@&{}>", id));
+            // If not everyone has voted and we haven't met the minimum,
+            // then voting isn't complete
+            if voted_count < min_required && voted_count < members.len() {
+                voting_complete = false;
+            }
+        }
+    }
+    
+    // If minimum requirements can't be met, or if everyone has voted, we're done
+    if !min_requirements_possible || voting_complete {
+        // If requirements can't be met, there's no point in finding an optimal slot
+        if !min_requirements_possible {
+            // Show a message explaining why voting failed
+            let mut description = "**Voting Results**\n\n".to_string();
+            description.push_str("The meeting cannot be scheduled because not enough members are available.\n\n");
+            
+            // Add details about each group
+            description.push_str("**Group Status:**\n");
+            for (group_name, voted_count, min_required, _) in groups_status {
+                description.push_str(&format!(
+                    "• **{}**: {}/{} members voted (minimum required: {})\n",
+                    group_name, voted_count, min_required, min_required
+                ));
+            }
+            
+            // Get role mentions for status notification
+            let mut role_mentions = Vec::new();
+            for group_name in &poll.group_names {
+                // Query to get the role ID for this group
+                let role_query = sqlx::query(
+                    "SELECT role_id FROM discord_groups WHERE name = $1 AND server_id = $2"
+                )
+                .bind(group_name)
+                .bind(component.guild_id.unwrap().to_string())
+                .fetch_optional(&ctx.db_pool)
+                .await;
+                
+                if let Ok(Some(row)) = role_query {
+                    if let Ok(Some(id)) = row.try_get::<Option<String>, _>("role_id") {
+                        role_mentions.push(format!("<@&{}>", id));
+                    }
                 }
             }
+            
+            // Create notification message
+            let notification = if !role_mentions.is_empty() {
+                format!("❌ {} Meeting scheduling failed due to insufficient availability.", 
+                       role_mentions.join(" "))
+            } else {
+                "❌ Meeting scheduling failed due to insufficient availability.".to_string()
+            };
+            
+            // Update the message to show the failure
+            component.message.edit(&ctx.ctx.http, |m| {
+                m.content(&notification)
+                    .embed(|e| {
+                        e.title("Not Enough Members Available")
+                            .description(description)
+                            .color(Color::RED)
+                            .footer(|f| f.text("Consider adjusting the minimum requirements or try with different groups"))
+                    })
+                    .components(|c| c) // Clear components
+            }).await?;
+            
+            // Remove the poll from active polls
+            polls.remove(&component.message.id);
+            return Ok(());
         }
         
-        // Create ping message for attendees and roles
-        let ping_message = {
-            let mut message = "🔔 Meeting confirmed! ".to_string();
+        // Otherwise, try to find an optimal meeting time
+        let optimal_slot = find_optimal_meeting_slot(poll);
+        
+        if let Some((_day_idx, slot_info, attending_users)) = optimal_slot {
+            // We found a good meeting time
+            // Format date for display
+            let tz = chrono_tz::Tz::from_str(&poll.timezone).unwrap_or(chrono_tz::UTC);
+            let day_date = slot_info.start.with_timezone(&tz).format("%A, %B %d, %Y").to_string();
             
-            // Add role pings
-            if !role_mentions.is_empty() {
-                message.push_str(&format!("{} ", role_mentions.join(" ")));
+            // Create description for the message
+            let mut description = format!(
+                "**Meeting Time Confirmed!**\n\n**{}**\n**{}**\n\n",
+                day_date,
+                slot_info.formatted_time
+            );
+            
+            // Add details about each group
+            description.push_str("**Group Attendance:**\n");
+            for (group_name, voted_count, min_required, min_met) in groups_status {
+                description.push_str(&format!(
+                    "• **{}**: {}/{} members (minimum required: {}) {}\n",
+                    group_name, 
+                    voted_count, 
+                    min_required,
+                    min_required,
+                    if min_met { "✅" } else { "❓" }
+                ));
             }
             
-            // Add individual attendee pings
-            if !attending_users.is_empty() {
-                message.push_str("- Please mark your calendars!");
+            description.push_str("\n**Attendees:**\n");
+            for user_id in &attending_users {
+                description.push_str(&format!("• <@{}>\n", user_id));
+            }
+            
+            // Get role IDs for all groups to ping during announcement
+            let mut role_mentions = Vec::new();
+            for group_name in &poll.group_names {
+                // Query to get the role ID for this group
+                let role_query = sqlx::query(
+                    "SELECT role_id FROM discord_groups WHERE name = $1 AND server_id = $2"
+                )
+                .bind(group_name)
+                .bind(component.guild_id.unwrap().to_string())
+                .fetch_optional(&ctx.db_pool)
+                .await;
+                
+                if let Ok(Some(row)) = role_query {
+                    if let Ok(Some(id)) = row.try_get::<Option<String>, _>("role_id") {
+                        role_mentions.push(format!("<@&{}>", id));
+                    }
+                }
+            }
+            
+            // Create ping message for attendees and roles
+            let ping_message = {
+                let mut message = "🔔 Meeting confirmed! ".to_string();
+                
+                // Add role pings
+                if !role_mentions.is_empty() {
+                    message.push_str(&format!("{} ", role_mentions.join(" ")));
+                }
+                
+                // Add individual attendee pings
+                if !attending_users.is_empty() {
+                    message.push_str("- Please mark your calendars!");
+                } else {
+                    message.push_str("Please mark your calendars!");
+                }
+                
+                message
+            };
+            
+            // Update the message to show the confirmation
+            component.message.edit(&ctx.ctx.http, |m| {
+                m.content(&ping_message)
+                    .embed(|e| {
+                        e.title("Meeting Time Confirmed!")
+                            .description(description)
+                            .color(Color::DARK_GREEN)
+                            .footer(|f| f.text(format!(
+                                "Min members per group: {} • {} attendees • Timezone: {}",
+                                poll.min_per_group,
+                                attending_users.len(),
+                                poll.timezone
+                            )))
+                    })
+                    .components(|c| c) // Clear components
+            }).await?;
+            
+            // Remove the poll from active polls
+            polls.remove(&component.message.id);
+        } else {
+            // No suitable meeting time found
+            // Get role mentions for notification
+            let mut role_mentions = Vec::new();
+            for group_name in &poll.group_names {
+                // Query to get the role ID for this group
+                let role_query = sqlx::query(
+                    "SELECT role_id FROM discord_groups WHERE name = $1 AND server_id = $2"
+                )
+                .bind(group_name)
+                .bind(component.guild_id.unwrap().to_string())
+                .fetch_optional(&ctx.db_pool)
+                .await;
+                
+                if let Ok(Some(row)) = role_query {
+                    if let Ok(Some(id)) = row.try_get::<Option<String>, _>("role_id") {
+                        role_mentions.push(format!("<@&{}>", id));
+                    }
+                }
+            }
+            
+            // Create notification message
+            let notification = if !role_mentions.is_empty() {
+                format!("❌ {} No suitable meeting time could be found.", 
+                       role_mentions.join(" "))
             } else {
-                message.push_str("Please mark your calendars!");
-            }
+                "❌ No suitable meeting time could be found.".to_string()
+            };
             
-            message
-        };
-        
-        // Update the message to show the confirmation
-        component.message.edit(&ctx.ctx.http, |m| {
-            m.content(&ping_message)
-                .embed(|e| {
-                    e.title("Meeting Time Confirmed!")
-                        .description(description)
-                        .color(Color::DARK_GREEN)
-                        .footer(|f| f.text(format!(
-                            "Min members per group: {} • {} attendees • Timezone: {}",
-                            poll.min_per_group,
-                            attending_users.len(),
-                            poll.timezone
-                        )))
-                })
-                .components(|c| c) // Clear components
-        }).await?;
-        
-        // Remove the poll from active polls
-        polls.remove(&component.message.id);
+            component.message.edit(&ctx.ctx.http, |m| {
+                m.content(&notification)
+                    .embed(|e| {
+                        e.title("No Suitable Meeting Time Found")
+                            .description("We could not find a time slot where enough members from each group are available. You may want to try again with different parameters or ask members to update their availability.")
+                            .color(Color::RED)
+                    })
+                    .components(|c| c) // Clear components
+            }).await?;
+            
+            // Remove the poll from active polls
+            polls.remove(&component.message.id);
+        }
     } else {
-        // No suitable meeting time found
-        component.message.edit(&ctx.ctx.http, |m| {
-            m.content("❌ No suitable meeting time could be found. Consider trying with different groups or ask members to update their availability.")
-                .embed(|e| {
-                    e.title("No Suitable Meeting Time Found")
-                        .description("We could not find a meeting time where enough members from each group are available. You may want to try again with different parameters.")
-                        .color(Color::RED)
-                })
-                .components(|c| c) // Clear components
-        }).await?;
+        // Voting is still in progress, update the UI and let people continue voting
+        // Close the polls lock before calling update_time_slot_message
+        let poll_clone = poll.clone();
+        // Drop the write lock to avoid borrow issues
+        drop(polls);
         
-        // Remove the poll from active polls
-        polls.remove(&component.message.id);
+        // Now update the message with the cloned poll data
+        update_time_slot_message(ctx, component, &poll_clone).await?;
     }
     
     Ok(())
@@ -1859,88 +2085,86 @@ async fn update_time_slot_message(
     let voter_id = component.user.id.to_string();
     let user_selected_slots = poll.slot_responses.get(&voter_id).cloned().unwrap_or_default();
     
-    // Update the message with the new day's slots and highlight selected ones
-    component.create_interaction_response(&ctx.ctx.http, |r| {
-        r.kind(InteractionResponseType::UpdateMessage)
-            .interaction_response_data(|m| {
-                m.embed(|e| {
-                    e.title(format!("Vote on Your Availability - Day {} of {}", 
-                                  poll.current_day + 1, 
-                                  poll.day_slots.len()))
-                        .description(&time_slot_message)
-                        .color(Color::GOLD)
-                        .footer(|f| f.text(format!(
-                            "Min members per group: {} • Slot duration: {} min • Timezone: {}",
-                            poll.min_per_group,
-                            poll.slot_duration,
-                            poll.timezone
-                        )))
-                })
-                .components(|c| {
-                    // Add time slot selection buttons
-                    if let Some(slots) = poll.day_slots.get(&poll.current_day) {
-                        for chunk in slots.chunks(5) {
-                            c.create_action_row(|row| {
-                                for slot in chunk {
-                                    // Check if this slot is selected by the current user
-                                    let is_selected = user_selected_slots.contains(&slot.id);
-                                    
-                                    row.create_button(|b| {
-                                        b.custom_id(format!("slot_{}", slot.id))
-                                            .label(&slot.formatted_time)
-                                            .style(if is_selected {
-                                                serenity::model::application::component::ButtonStyle::Primary
-                                            } else {
-                                                serenity::model::application::component::ButtonStyle::Secondary
-                                            })
-                                    });
-                                }
-                                row
+    // Instead of using the interaction response, directly edit the message
+    // This avoids the "interaction already acknowledged" error
+    component.message.edit(&ctx.ctx.http, |m| {
+        m.embed(|e| {
+            e.title(format!("Vote on Your Availability - Day {} of {}", 
+                          poll.current_day + 1, 
+                          poll.day_slots.len()))
+                .description(&time_slot_message)
+                .color(Color::GOLD)
+                .footer(|f| f.text(format!(
+                    "Min members per group: {} • Slot duration: {} min • Timezone: {}",
+                    poll.min_per_group,
+                    poll.slot_duration,
+                    poll.timezone
+                )))
+        })
+        .components(|c| {
+            // Add time slot selection buttons
+            if let Some(slots) = poll.day_slots.get(&poll.current_day) {
+                for chunk in slots.chunks(5) {
+                    c.create_action_row(|row| {
+                        for slot in chunk {
+                            // Check if this slot is selected by the current user
+                            let is_selected = user_selected_slots.contains(&slot.id);
+                            
+                            row.create_button(|b| {
+                                b.custom_id(format!("slot_{}", slot.id))
+                                    .label(&slot.formatted_time)
+                                    .style(if is_selected {
+                                        serenity::model::application::component::ButtonStyle::Success // Green for selected
+                                    } else {
+                                        serenity::model::application::component::ButtonStyle::Secondary // Neutral/gray for not selected
+                                    })
                             });
                         }
-                    }
-                    
-                    // Add navigation and utility buttons
-                    c.create_action_row(|row| {
-                        // Previous day button
-                        row.create_button(|b| {
-                            b.custom_id("prev_day")
-                                .label("◀️ Previous Day")
-                                .style(serenity::model::application::component::ButtonStyle::Primary)
-                                .disabled(poll.current_day == 0)
-                        });
-                        
-                        // Next day button
-                        row.create_button(|b| {
-                            b.custom_id("next_day")
-                                .label("Next Day ▶️")
-                                .style(serenity::model::application::component::ButtonStyle::Primary)
-                                .disabled(poll.current_day >= poll.day_slots.len() - 1)
-                        });
-                        
                         row
                     });
-                    
-                    // Add select all / clear buttons
-                    c.create_action_row(|row| {
-                        row.create_button(|b| {
-                            b.custom_id("select_all")
-                                .label("Select All")
-                                .style(serenity::model::application::component::ButtonStyle::Success)
-                        })
-                        .create_button(|b| {
-                            b.custom_id("clear_all")
-                                .label("Clear All")
-                                .style(serenity::model::application::component::ButtonStyle::Danger)
-                        })
-                        .create_button(|b| {
-                            b.custom_id("finish_voting")
-                                .label("Finish Voting")
-                                .style(serenity::model::application::component::ButtonStyle::Primary)
-                        })
-                    })
+                }
+            }
+            
+            // Add navigation and utility buttons
+            c.create_action_row(|row| {
+                // Previous day button
+                row.create_button(|b| {
+                    b.custom_id("prev_day")
+                        .label("◀️ Previous Day")
+                        .style(serenity::model::application::component::ButtonStyle::Primary)
+                        .disabled(poll.current_day == 0)
+                });
+                
+                // Next day button
+                row.create_button(|b| {
+                    b.custom_id("next_day")
+                        .label("Next Day ▶️")
+                        .style(serenity::model::application::component::ButtonStyle::Primary)
+                        .disabled(poll.current_day >= poll.day_slots.len() - 1)
+                });
+                
+                row
+            });
+            
+            // Add select all / clear buttons
+            c.create_action_row(|row| {
+                row.create_button(|b| {
+                    b.custom_id("select_all")
+                        .label("Select All")
+                        .style(serenity::model::application::component::ButtonStyle::Success)
+                })
+                .create_button(|b| {
+                    b.custom_id("clear_all")
+                        .label("Clear All")
+                        .style(serenity::model::application::component::ButtonStyle::Danger)
+                })
+                .create_button(|b| {
+                    b.custom_id("finish_voting")
+                        .label("Finish Voting")
+                        .style(serenity::model::application::component::ButtonStyle::Primary)
                 })
             })
+        })
     }).await?;
     
     Ok(())
