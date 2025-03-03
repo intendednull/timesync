@@ -193,6 +193,7 @@ pub struct ActivePoll {
     pub required_yes_count: usize,
     pub responses: HashMap<String, bool>, // user_id -> yes/no (legacy)
     pub slot_responses: HashMap<String, Vec<String>>, // user_id -> list of slot IDs they are available for
+    pub locked_votes: HashMap<String, bool>, // user_id -> whether they've locked in their votes
     pub db_pool: sqlx::PgPool,
     pub timezone: String,
     pub eligible_voters: String, // Comma-separated list of eligible voter IDs

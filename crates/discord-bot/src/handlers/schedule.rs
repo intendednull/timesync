@@ -658,6 +658,13 @@ pub async fn handle_match_command(
         .unwrap_or(7)
         .max(1)
         .min(7);
+        
+    // Get optional time span (human-friendly format)
+    let time_span = command.data.options.iter()
+        .find(|opt| opt.name == "time_span")
+        .and_then(|opt| opt.value.as_ref())
+        .and_then(|val| val.as_str())
+        .map(|s| s.to_string());
     
     // Request a high number of matches to avoid running out
     let count = 50; // Set to a high value instead of using a parameter
@@ -718,12 +725,20 @@ pub async fn handle_match_command(
     };
     
     let client = reqwest::Client::new();
+    // Build the query parameters
+    let mut query_params = vec![
+        ("group_ids", match_request.group_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",")),
+        ("min_per_group", min_per_group.to_string()),
+        ("count", count.to_string()),
+    ];
+    
+    // Add time_span if provided
+    if let Some(span) = &time_span {
+        query_params.push(("time_span", span.clone()));
+    }
+    
     let response = client.get(format!("{}/api/availability/match", ctx.config.web_base_url))
-        .query(&[
-            ("group_ids", match_request.group_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",")),
-            ("min_per_group", min_per_group.to_string()),
-            ("count", count.to_string()),
-        ])
+        .query(&query_params)
         .send()
         .await?;
     
@@ -771,10 +786,13 @@ pub async fn handle_match_command(
         group_members.insert(*group_id, member_ids);
     }
     
-    // Set the required "Yes" votes (6 per group or all members if less than 6)
+    // Calculate minimum required members per group (default to 6)
+    let min_required_per_group = 6;
+    
+    // Set the required "Yes" votes (min_required_per_group per group or all members if less than min_required_per_group)
     let mut required_yes_count = 0;
     for members in group_members.values() {
-        required_yes_count += std::cmp::min(6, members.len());
+        required_yes_count += std::cmp::min(min_required_per_group, members.len());
     }
     
     // Get the server's timezone or use UTC as default
@@ -835,6 +853,7 @@ pub async fn handle_match_command(
         display_days,
         current_day: 0, // Start with first day
         day_slots,
+        locked_votes: HashMap::new(), // New field for tracking locked votes
     };
     
     // Get role mentions for all groups
@@ -863,10 +882,56 @@ pub async fn handle_match_command(
         String::new()
     };
     
-    // Format the time slot buttons message
-    let time_slot_message = format_time_slots(&active_poll);
+    // Create a new modified poll with correct initial state for all members
+    let mut modified_poll = active_poll.clone();
     
-    // Create a new message with role pings instead of editing to ensure mentions trigger properly
+    // Get all slot IDs from all days
+    let all_slot_ids: Vec<String> = modified_poll.day_slots.values()
+        .flat_map(|slots| slots.iter().map(|slot| slot.id.clone()))
+        .collect();
+    
+    // IMPORTANT: First, initialize everyone to having NO slots selected
+    // This ensures members without schedules or who we can't determine start with empty selections
+    for eligible_voter in modified_poll.eligible_voters.split(',').filter(|s| !s.is_empty()) {
+        modified_poll.slot_responses.insert(eligible_voter.to_string(), Vec::new());
+    }
+    
+    // Then, for each group member, check if they have a schedule
+    let mut schedule_linkage_results = Vec::new();
+    for group_members in &modified_poll.group_members {
+        for member_id in group_members.1.iter() {
+            // Check if the member has a schedule
+            let has_schedule = sqlx::query_scalar!(
+                "SELECT schedule_id FROM discord_users WHERE discord_id = $1",
+                member_id
+            )
+            .fetch_optional(&ctx.db_pool)
+            .await
+            .map_or(false, |schedule_id| schedule_id.is_some());
+            
+            schedule_linkage_results.push((member_id.to_string(), has_schedule));
+        }
+    }
+    
+    // Now, update only those with schedules to have all slots selected
+    for (member_id, has_schedule) in schedule_linkage_results {
+        if has_schedule {
+            // If they have a schedule, pre-select all slots
+            modified_poll.slot_responses.insert(member_id, all_slot_ids.clone());
+        }
+        // Those without schedules remain with empty selection (already set above)
+    }
+    
+    // First store the modified poll before creating the message
+    let mut polls = ctx.active_polls.write().await;
+    // Create a temporary message ID for this poll
+    let temp_message_id = serenity::model::id::MessageId(command.id.0);
+    polls.insert(temp_message_id, modified_poll.clone());
+    drop(polls); // Drop the lock before doing more operations
+    
+    // Generate a summary message for the main message
+    let summary_message = generate_summary_message(&modified_poll, min_required_per_group);
+    
     // Send the role pings in a separate message to ensure they trigger notifications
     if !role_ping.is_empty() {
         command.create_followup_message(&ctx.ctx.http, |m| {
@@ -874,103 +939,181 @@ pub async fn handle_match_command(
         }).await?;
     }
     
-    // Then edit the original response with the voting UI
-    let message = command.edit_original_interaction_response(&ctx.ctx.http, |m| {
-        m.content("");
-        
+    // Then edit the original response with the main message UI
+    let main_message = command.edit_original_interaction_response(&ctx.ctx.http, |m| {
         m.embed(|e| {
-            e.title(format!("Vote on Your Availability - Day {} of {}", 
-                          active_poll.current_day + 1, 
-                          active_poll.day_slots.len()))
-                .description(&time_slot_message)
+            e.title("Meeting Time Proposal")
+                .description(&summary_message)
                 .color(Color::GOLD)
                 .footer(|f| f.text(format!(
                     "Min members per group: {} • Slot duration: {} min • Timezone: {}",
-                    min_per_group,
+                    min_required_per_group,
                     slot_duration,
                     timezone
                 )))
         })
         .components(|c| {
-            // Add time slot selection buttons
-            if let Some(slots) = active_poll.day_slots.get(&active_poll.current_day) {
-                for chunk in slots.chunks(5) {
-                    c.create_action_row(|row| {
-                        for slot in chunk {
-                            row.create_button(|b| {
-                                b.custom_id(format!("slot_{}", slot.id))
-                                    .label(format!("{} [0]", &slot.formatted_time)) // Start with zero votes
-                                    .style(serenity::model::application::component::ButtonStyle::Success) // Start as selected
-                            });
-                        }
-                        row
-                    });
-                }
-            }
-            
-            // Add navigation and utility buttons
             c.create_action_row(|row| {
-                // Previous day button
+                // Edit votes button
                 row.create_button(|b| {
-                    b.custom_id("prev_day")
-                        .label("◀️ Previous Day")
+                    b.custom_id("open_voting")
+                        .label("Edit Your Availability")
                         .style(serenity::model::application::component::ButtonStyle::Primary)
-                        .disabled(active_poll.current_day == 0)
-                });
-                
-                // Next day button
-                row.create_button(|b| {
-                    b.custom_id("next_day")
-                        .label("Next Day ▶️")
-                        .style(serenity::model::application::component::ButtonStyle::Primary)
-                        .disabled(active_poll.current_day == active_poll.day_slots.len() - 1)
-                });
-                
-                row
-            });
-            
-            // Add select all / clear buttons
-            c.create_action_row(|row| {
-                row.create_button(|b| {
-                    b.custom_id("select_all")
-                        .label("Select All")
+                        .emoji('✏')
+                })
+                .create_button(|b| {
+                    b.custom_id("lock_votes")
+                        .label("Lock In My Votes")
                         .style(serenity::model::application::component::ButtonStyle::Success)
-                })
-                .create_button(|b| {
-                    b.custom_id("clear_all")
-                        .label("Clear All Days")
-                        .style(serenity::model::application::component::ButtonStyle::Danger)
-                })
-                .create_button(|b| {
-                    b.custom_id("submit_votes")
-                        .label("Submit Votes")
-                        .style(serenity::model::application::component::ButtonStyle::Primary)
+                        .emoji('🔒')
                 })
             })
         })
     }).await?;
     
-    // Pre-select all time slots for all eligible voters before storing the poll
-    // This makes the default state "available" for all time slots
-    {
-        let mut modified_poll = active_poll.clone();
-        
-        // Get all slot IDs from all days
-        let all_slot_ids: Vec<String> = modified_poll.day_slots.values()
-            .flat_map(|slots| slots.iter().map(|slot| slot.id.clone()))
-            .collect();
-        
-        // For each eligible voter, pre-select all slots
-        for voter_id in modified_poll.eligible_voters.split(',').filter(|s| !s.is_empty()) {
-            modified_poll.slot_responses.insert(voter_id.to_string(), all_slot_ids.clone());
-        }
-        
-        // Store the poll state with pre-selected slots
-        let mut polls = ctx.active_polls.write().await;
-        polls.insert(message.id, modified_poll);
-    }
+    // Update the poll store with the message ID
+    let mut polls = ctx.active_polls.write().await;
+    // Remove the temporary entry with command.id
+    let temp_message_id = serenity::model::id::MessageId(command.id.0);
+    let poll_data = polls.remove(&temp_message_id).unwrap_or(modified_poll);
+    // Insert with the correct message ID
+    polls.insert(main_message.id, poll_data);
+    drop(polls);
     
     Ok(())
+}
+
+/// Generate a summary message for the main match message
+fn generate_summary_message(poll: &super::ActivePoll, min_required_per_group: usize) -> String {
+    let mut message = String::new();
+    
+    // Get the date range
+    let date_range = if !poll.day_slots.is_empty() {
+        let tz = chrono_tz::Tz::from_str(&poll.timezone).unwrap_or(chrono_tz::UTC);
+        
+        // Get the first and last day
+        let first_day_idx = poll.day_slots.keys().min().unwrap_or(&0);
+        let last_day_idx = poll.day_slots.keys().max().unwrap_or(&0);
+        
+        // Get the dates from the first slots of each day
+        if let (Some(first_day_slots), Some(last_day_slots)) = (poll.day_slots.get(first_day_idx), poll.day_slots.get(last_day_idx)) {
+            if !first_day_slots.is_empty() && !last_day_slots.is_empty() {
+                let first_date = first_day_slots[0].start.with_timezone(&tz).format("%B %d, %Y").to_string();
+                let last_date = last_day_slots[0].start.with_timezone(&tz).format("%B %d, %Y").to_string();
+                
+                if first_date == last_date {
+                    format!("**{}**", first_date)
+                } else {
+                    format!("**{} to {}**", first_date, last_date)
+                }
+            } else {
+                "Date range unavailable".to_string()
+            }
+        } else {
+            "Date range unavailable".to_string()
+        }
+    } else {
+        "Date range unavailable".to_string()
+    };
+    
+    message.push_str(&format!("{}\n\n", date_range));
+    
+    // Get users who have voted
+    let _voted_users: std::collections::HashSet<&String> = poll.slot_responses.keys().collect();
+    let locked_users: std::collections::HashSet<&String> = poll.locked_votes.keys().collect();
+    let total_eligible = poll.eligible_voters.split(',').filter(|s| !s.is_empty()).count();
+    
+    // Create a voting progress report by group
+    message.push_str("**Voting Progress:**\n");
+    
+    // Calculate votes by group to show progress
+    for (idx, (_group_id, members)) in poll.group_members.iter().enumerate() {
+        // Try to get the group name if available (using the index as a best effort)
+        let group_name = poll.group_names.get(idx)
+            .unwrap_or(&format!("Group {}", idx + 1))
+            .clone();
+            
+        let min_required = min_required_per_group;
+        let voted_count = members.iter().filter(|m| locked_users.contains(m)).count();
+        let total_count = members.len();
+        
+        message.push_str(&format!(
+            "• **{}**: {}/{} members locked in votes (min required: {})\n",
+            group_name,
+            voted_count,
+            total_count,
+            min_required
+        ));
+    }
+    
+    message.push_str(&format!("\n**Total: {} of {} members have locked in their votes**\n\n", 
+        locked_users.len(), 
+        total_eligible
+    ));
+    
+    // Find the best slot (if any)
+    if let Some((_day_idx, slot_info, attending_users)) = find_optimal_meeting_slot(poll, min_required_per_group) {
+        // Format the best time
+        let tz = chrono_tz::Tz::from_str(&poll.timezone).unwrap_or(chrono_tz::UTC);
+        let day_date = slot_info.start.with_timezone(&tz).format("%A, %B %d, %Y").to_string();
+        
+        message.push_str("**Most Popular Time Slot:**\n");
+        message.push_str(&format!("• **{}** at **{}**\n", day_date, slot_info.formatted_time));
+        message.push_str(&format!("• **{} members available**\n", attending_users.len()));
+        
+        // Check if this slot meets requirements for all groups
+        let mut all_groups_meet_min = true;
+        let mut group_slots_status = Vec::new();
+        
+        for (idx, (_group_id, members)) in poll.group_members.iter().enumerate() {
+            let group_name = poll.group_names.get(idx)
+                .unwrap_or(&format!("Group {}", idx + 1))
+                .clone();
+                
+            let min_required = std::cmp::min(min_required_per_group, members.len());
+            
+            // Count how many members from this group voted for this slot
+            let available_count = members.iter()
+                .filter(|m| attending_users.contains(m))
+                .count();
+                
+            let meets_min = available_count >= min_required;
+            if !meets_min {
+                all_groups_meet_min = false;
+            }
+            
+            group_slots_status.push((group_name, available_count, min_required, meets_min));
+        }
+        
+        // Show status for each group
+        for (group_name, available_count, min_required, meets_min) in group_slots_status {
+            message.push_str(&format!(
+                "• **{}**: {}/{} members available {}\n",
+                group_name,
+                available_count,
+                min_required,
+                if meets_min { "✅" } else { "❌" }
+            ));
+        }
+        
+        if all_groups_meet_min {
+            message.push_str("\n✅ **This time slot meets all group requirements!**\n");
+        } else {
+            message.push_str("\n❌ **This time slot does not meet all group requirements yet.**\n");
+        }
+    } else {
+        message.push_str("**No suitable time slot found yet**\n");
+        message.push_str("More members need to vote to find a time that works for everyone.\n");
+    }
+    
+    // Add instructions
+    message.push_str("\n**How to Vote:**\n");
+    message.push_str("• Click **Edit Your Availability** to select the times you're available\n");
+    message.push_str("• When you're done, click **Lock In My Votes** to confirm your selection\n");
+    message.push_str("• If you don't select any times, you'll be marked as unavailable\n");
+    message.push_str("• Members with saved schedules have their slots pre-selected\n");
+    
+    message
 }
 
 /// Organize time slots by day
@@ -1118,9 +1261,10 @@ fn format_time_slots(poll: &super::ActivePoll) -> String {
     // Time slots are now shown directly in the buttons
     
     // Add instructions
-    message.push_str("Click on a time to toggle your availability. All times are selected by default. Green buttons indicate times you're available for. The number in brackets [0] shows how many people have selected that time.\n");
+    message.push_str("Click on a time to toggle your availability. Green buttons indicate times you're available for. The number in brackets [0] shows how many people have selected that time.\n");
+    message.push_str("Users with saved schedules will have their slots pre-selected. Users without schedules start with no selections.\n");
     message.push_str("Use the navigation buttons to switch between days. 'Clear All Days' will mark you as unavailable for all days.\n");
-    message.push_str("When you're done, click 'Submit Votes' to lock in your selections. If you've cleared all times, you'll be marked as unavailable.\n\n");
+    message.push_str("When you're done, click 'Submit Votes' to lock in your selections. If you don't select any times, you'll be marked as unavailable.\n\n");
     
     message
 }
@@ -1132,23 +1276,591 @@ pub async fn handle_component_interaction(
 ) -> Result<()> {
     let custom_id = component.data.custom_id.clone();
     
-    match custom_id.as_str() {
-        // Legacy handlers
-        "match_yes" | "match_no" => handle_match_vote(ctx, component, custom_id == "match_yes").await,
-        "match_confirm" => handle_match_confirm(ctx, component).await,
+    // First check if the message ID is in active_polls to decide on interaction approach
+    let is_navigation_on_ephemeral = {
+        let polls = ctx.active_polls.read().await;
         
-        // New time slot voting handlers
-        "prev_day" => handle_prev_day(ctx, component).await,
-        "next_day" => handle_next_day(ctx, component).await,
-        "select_all" => handle_select_all_slots(ctx, component).await,
-        "clear_all" => handle_clear_all_slots(ctx, component).await,
-        "submit_votes" => handle_submit_votes(ctx, component).await,
+        // Check if using a nav button on an ephemeral message by looking at button ID
+        // and checking if the message is not in active polls
+        let is_nav_button = ["prev_day", "next_day", "select_all", "clear_all", "submit_votes", "return_to_main"]
+            .contains(&custom_id.as_str()) || custom_id.starts_with("slot_");
+        
+        // If it's a navigation button but doesn't match any active poll message, it might be ephemeral
+        is_nav_button && !polls.contains_key(&component.message.id)
+    };
+    
+    // Special handling for buttons in ephemeral messages - they need different approach
+    if is_navigation_on_ephemeral {
+        // For ephemeral message buttons, we need to acknowledge first to keep the interaction alive
+        match component.create_interaction_response(&ctx.ctx.http, |r| {
+            r.kind(InteractionResponseType::DeferredUpdateMessage)
+        }).await {
+            Ok(_) => {
+                tracing::info!("Successfully acknowledged ephemeral interaction");
+            },
+            Err(e) => {
+                tracing::warn!("Failed to acknowledge ephemeral interaction, but continuing: {}", e);
+            }
+        }
+    }
+    
+    // Helper to safely handle interaction with error recovery
+    let result = match custom_id.as_str() {
+        // Legacy handlers
+        "match_yes" | "match_no" => handle_match_vote(ctx.clone(), component, custom_id == "match_yes").await,
+        "match_confirm" => handle_match_confirm(ctx.clone(), component).await,
+        
+        // Main message buttons
+        "open_voting" => handle_open_voting_interface(ctx.clone(), component).await,
+        "lock_votes" => handle_lock_votes(ctx.clone(), component).await,
+        
+        // Personal voting interface handlers
+        "prev_day" => handle_prev_day(ctx.clone(), component, is_navigation_on_ephemeral).await,
+        "next_day" => handle_next_day(ctx.clone(), component, is_navigation_on_ephemeral).await,
+        "select_all" => handle_select_all_slots(ctx.clone(), component, is_navigation_on_ephemeral).await,
+        "clear_all" => handle_clear_all_slots(ctx.clone(), component, is_navigation_on_ephemeral).await,
+        "submit_votes" => handle_submit_votes(ctx.clone(), component).await,
+        "return_to_main" => handle_return_to_main(ctx.clone(), component).await,
         _ if custom_id.starts_with("slot_") => {
             let slot_id = custom_id.strip_prefix("slot_").unwrap_or("");
-            handle_slot_toggle(ctx, component, slot_id).await
+            handle_slot_toggle(ctx.clone(), component, slot_id, is_navigation_on_ephemeral).await
         },
         _ => Ok(()),
+    };
+    
+    // Properly handle errors with a user-friendly follow-up message
+    if let Err(e) = result {
+        tracing::error!("Error handling component interaction: \n{}", e);
+        
+        // When an error occurs, try to send a follow-up message
+        // This is a fallback in case the interaction can't be acknowledged
+        if !is_navigation_on_ephemeral {
+            // Only attempt to send follow-up for non-ephemeral interactions
+            // as we may have already used up our response for ephemeral ones
+            let _ = component.create_followup_message(&ctx.ctx.http, |m| {
+                m.content(format!("There was an error processing your request. Please try again."))
+                    .ephemeral(true)
+            }).await;
+        }
+        
+        return Err(e);
     }
+    
+    Ok(())
+}
+
+/// Handle opening the personal voting interface
+async fn handle_open_voting_interface(
+    ctx: HandlerContext,
+    component: &mut MessageComponentInteraction,
+) -> Result<()> {
+    // Get the voter ID
+    let voter_id = component.user.id.to_string();
+    
+    // Get the poll associated with the main message
+    let polls = ctx.active_polls.read().await;
+    let poll = polls.get(&component.message.id)
+        .ok_or_else(|| eyre::eyre!("No active poll found for this message"))?
+        .clone(); // Clone to avoid holding the read lock
+    drop(polls);
+    
+    // Check if the user is an eligible voter
+    let eligible_voters: Vec<String> = if poll.eligible_voters.is_empty() {
+        Vec::new()
+    } else {
+        poll.eligible_voters.split(',').map(|s| s.to_string()).collect()
+    };
+    
+    if !eligible_voters.contains(&voter_id) {
+        // Acknowledge the interaction
+        component.create_interaction_response(&ctx.ctx.http, |r| {
+            r.kind(InteractionResponseType::ChannelMessageWithSource)
+                .interaction_response_data(|m| {
+                    m.content("You are not a member of any of the groups in this poll, so you cannot vote.")
+                        .ephemeral(true)
+                })
+        }).await?;
+        
+        return Ok(());
+    }
+    
+    // Create a personal ephemeral voting interface with the current state of their votes
+    // This will be visible only to the user who clicked the button
+    
+    // Get the user's current selections
+    let user_selections = poll.slot_responses.get(&voter_id).cloned().unwrap_or_default();
+    
+    // Format the time slot message for the personal interface
+    let time_slot_message = format_personal_time_slots(&poll, &voter_id);
+    
+    // Send the ephemeral message with the voting interface
+    component.create_interaction_response(&ctx.ctx.http, |r| {
+        r.kind(InteractionResponseType::ChannelMessageWithSource)
+            .interaction_response_data(|m| {
+                m.ephemeral(true) // Important: Make this visible only to the user
+                    .embed(|e| {
+                        e.title(format!("Your Availability - Day {} of {}", 
+                                    poll.current_day + 1, 
+                                    poll.day_slots.len()))
+                            .description(&time_slot_message)
+                            .color(Color::GOLD)
+                            .footer(|f| f.text("Select all times when you are available"))
+                    })
+                    .components(|c| {
+                        // Add time slot selection buttons with correct vote count and selection status
+                        if let Some(slots) = poll.day_slots.get(&poll.current_day) {
+                            for chunk in slots.chunks(5) {
+                                c.create_action_row(|row| {
+                                    for slot in chunk {
+                                        // Check if this slot is selected by the current user
+                                        let is_selected = user_selections.contains(&slot.id);
+                                        
+                                        // Count total votes for this slot
+                                        let vote_count = poll.slot_responses.values()
+                                            .filter(|selected_slots| selected_slots.contains(&slot.id))
+                                            .count();
+                                            
+                                        row.create_button(|b| {
+                                            b.custom_id(format!("slot_{}", slot.id))
+                                                .label(format!("{} [{}]", &slot.formatted_time, vote_count))
+                                                .style(if is_selected {
+                                                    serenity::model::application::component::ButtonStyle::Success // Green for selected
+                                                } else {
+                                                    serenity::model::application::component::ButtonStyle::Secondary // Neutral/gray for not selected
+                                                })
+                                        });
+                                    }
+                                    row
+                                });
+                            }
+                        }
+                        
+                        // Add navigation and utility buttons
+                        c.create_action_row(|row| {
+                            // Previous day button
+                            row.create_button(|b| {
+                                b.custom_id("prev_day")
+                                    .label("◀️ Previous Day")
+                                    .style(serenity::model::application::component::ButtonStyle::Primary)
+                                    .disabled(poll.current_day == 0)
+                            });
+                            
+                            // Next day button
+                            row.create_button(|b| {
+                                b.custom_id("next_day")
+                                    .label("Next Day ▶️")
+                                    .style(serenity::model::application::component::ButtonStyle::Primary)
+                                    .disabled(poll.current_day >= poll.day_slots.len() - 1)
+                            });
+                            row
+                        });
+                        
+                        // Add select all / clear / submit buttons
+                        c.create_action_row(|row| {
+                            row.create_button(|b| {
+                                b.custom_id("select_all")
+                                    .label("Select All")
+                                    .style(serenity::model::application::component::ButtonStyle::Success)
+                            })
+                            .create_button(|b| {
+                                b.custom_id("clear_all")
+                                    .label("Clear All Days")
+                                    .style(serenity::model::application::component::ButtonStyle::Danger)
+                            })
+                            .create_button(|b| {
+                                b.custom_id("submit_votes")
+                                    .label("Submit Votes")
+                                    .style(serenity::model::application::component::ButtonStyle::Primary)
+                            })
+                        });
+                        
+                        // Add return button
+                        c.create_action_row(|row| {
+                            row.create_button(|b| {
+                                b.custom_id("return_to_main")
+                                    .label("Return to Main Message")
+                                    .style(serenity::model::application::component::ButtonStyle::Secondary)
+                            })
+                        })
+                    })
+            })
+    }).await?;
+    
+    Ok(())
+}
+
+/// Format time slots for display in the personal interface
+fn format_personal_time_slots(poll: &super::ActivePoll, user_id: &str) -> String {
+    // Get the current day's date
+    let current_day_slots = match poll.day_slots.get(&poll.current_day) {
+        Some(slots) => slots,
+        None => return "No time slots available for this day.".to_string(),
+    };
+    
+    if current_day_slots.is_empty() {
+        return "No time slots available for this day.".to_string();
+    }
+    
+    // Get the date from the first slot's start time
+    let tz = chrono_tz::Tz::from_str(&poll.timezone).unwrap_or(chrono_tz::UTC);
+    let day_date = current_day_slots[0].start.with_timezone(&tz).format("%A, %B %d, %Y").to_string();
+    
+    let mut message = format!("**{}**\n\nSelect all time slots when you are available:\n\n", day_date);
+    
+    // Get the user's currently selected slots
+    let user_selections = poll.slot_responses.get(user_id).cloned().unwrap_or_default();
+    
+    // Show which slots the user has selected
+    message.push_str("**Selected Time Slots:**\n");
+    
+    if user_selections.is_empty() {
+        message.push_str("You haven't selected any time slots yet.\n");
+    } else {
+        // Count how many slots are selected for this day
+        let current_day_selected_count = current_day_slots.iter()
+            .filter(|slot| user_selections.contains(&slot.id))
+            .count();
+            
+        message.push_str(&format!("You've selected {} time slots for this day.\n", current_day_selected_count));
+    }
+    
+    // Display lock status
+    let lock_status = if poll.locked_votes.contains_key(user_id) {
+        "✅ Your votes are locked in."
+    } else {
+        "❌ You have not locked in your votes yet."
+    };
+    
+    message.push_str(&format!("\n**Vote Status:** {}\n\n", lock_status));
+    
+    // Add instructions
+    message.push_str("Click on a time to toggle your availability. Green buttons indicate times you're available for.\n");
+    message.push_str("Use the navigation buttons to switch between days.\n");
+    message.push_str("When you're done selecting your availability, click 'Submit Votes' to update your selections.\n");
+    message.push_str("To finalize your votes, click 'Lock In My Votes' on the main message.\n");
+    
+    message
+}
+
+/// Handle return to main message button
+async fn handle_return_to_main(
+    ctx: HandlerContext,
+    component: &mut MessageComponentInteraction,
+) -> Result<()> {
+    // Delete the ephemeral message by updating it to be empty
+    component.create_interaction_response(&ctx.ctx.http, |r| {
+        r.kind(InteractionResponseType::UpdateMessage)
+            .interaction_response_data(|m| {
+                m.content("")
+                    .embed(|e| e.title("").description(""))
+                    .components(|c| c) // Clear components
+            })
+    }).await?;
+    
+    Ok(())
+}
+
+/// Handle locking in votes on the main message
+async fn handle_lock_votes(
+    ctx: HandlerContext,
+    component: &mut MessageComponentInteraction,
+) -> Result<()> {
+    // Get the voter ID
+    let voter_id = component.user.id.to_string();
+    
+    // Get the poll associated with this message
+    let mut polls = ctx.active_polls.write().await;
+    let poll = polls.get_mut(&component.message.id)
+        .ok_or_else(|| eyre::eyre!("No active poll found for this message"))?;
+    
+    // Check if the user is an eligible voter
+    let eligible_voters: Vec<String> = if poll.eligible_voters.is_empty() {
+        Vec::new()
+    } else {
+        poll.eligible_voters.split(',').map(|s| s.to_string()).collect()
+    };
+    
+    if !eligible_voters.contains(&voter_id) {
+        // Acknowledge the interaction
+        component.create_interaction_response(&ctx.ctx.http, |r| {
+            r.kind(InteractionResponseType::ChannelMessageWithSource)
+                .interaction_response_data(|m| {
+                    m.content("You are not a member of any of the groups in this poll, so you cannot vote.")
+                        .ephemeral(true)
+                })
+        }).await?;
+        
+        drop(polls); // Don't forget to drop the lock
+        return Ok(());
+    }
+    
+    // Acknowledge the interaction first - this should be done before any processing
+    let _ = component.create_interaction_response(&ctx.ctx.http, |r| {
+        r.kind(InteractionResponseType::DeferredUpdateMessage)
+    }).await;
+    
+    // Mark this user as having locked their votes
+    poll.locked_votes.insert(voter_id.clone(), true);
+    
+    // Calculate if the match is now finalized (all groups have enough votes)
+    // Calculate if match can be finalized
+    let min_required_per_group = 6; // Default to 6
+    let mut all_groups_have_enough = true;
+    let mut no_solution_possible = false;
+    let mut groups_status = Vec::new();
+    
+    for (idx, (_group_id, members)) in poll.group_members.iter().enumerate() {
+        let min_required = std::cmp::min(min_required_per_group, members.len());
+        
+        // Get members who have locked in votes and selected at least one time slot
+        let available_members = members.iter()
+            .filter(|m| {
+                poll.locked_votes.contains_key(*m) &&
+                poll.slot_responses.get(*m).map_or(false, |slots| !slots.is_empty())
+            })
+            .count();
+        
+        // Get members who have locked in votes but haven't selected any slots (unavailable)
+        let unavailable_members = members.iter()
+            .filter(|m| {
+                poll.locked_votes.contains_key(*m) &&
+                poll.slot_responses.get(*m).map_or(true, |slots| slots.is_empty())
+            })
+            .count();
+        
+        // Remaining members who haven't locked in votes yet
+        let remaining_members = members.len() - available_members - unavailable_members;
+        
+        // If there are too many unavailable members, it might be impossible to get enough
+        if available_members + remaining_members < min_required {
+            no_solution_possible = true;
+        }
+        
+        if available_members < min_required {
+            all_groups_have_enough = false;
+        }
+        
+        // Keep track of the group's status
+        let group_name = poll.group_names.get(idx)
+            .unwrap_or(&format!("Group {}", idx + 1))
+            .clone();
+            
+        groups_status.push((group_name, available_members, unavailable_members, remaining_members, min_required));
+    }
+    
+    // Get a clone of the poll before releasing the lock
+    let poll_clone = poll.clone();
+    
+    // If votes are finalized (either successfully or unsuccessfully), update the message
+    let should_finalize = all_groups_have_enough || no_solution_possible;
+    
+    // If we should finalize the match, remove the poll from active polls
+    if should_finalize {
+        polls.remove(&component.message.id);
+    }
+    
+    // Drop the lock before updating the message
+    drop(polls);
+    
+    // If a match is finalized, update the main message accordingly
+    if should_finalize {
+        // If no solution is possible, show failure message
+        if no_solution_possible {
+            // Create description for the failure message
+            let mut description = "**Matching Failed**\n\n".to_string();
+            description.push_str("The meeting cannot be scheduled because not enough members are available.\n\n");
+            
+            // Add details about each group
+            description.push_str("**Group Status:**\n");
+            for (group_name, available, unavailable, remaining, min_required) in groups_status {
+                description.push_str(&format!(
+                    "• **{}**: {}/{} members available, {} unavailable, {} haven't voted yet (min required: {})\n",
+                    group_name, available, min_required, unavailable, remaining, min_required
+                ));
+            }
+            
+            // Get role mentions for all groups
+            let mut role_mentions = Vec::new();
+            for group_name in &poll_clone.group_names {
+                // Query to get the role ID for this group
+                let role_query = sqlx::query(
+                    "SELECT role_id FROM discord_groups WHERE name = $1 AND server_id = $2"
+                )
+                .bind(group_name)
+                .bind(component.guild_id.unwrap().to_string())
+                .fetch_optional(&ctx.db_pool)
+                .await;
+                
+                if let Ok(Some(row)) = role_query {
+                    if let Ok(Some(id)) = row.try_get::<Option<String>, _>("role_id") {
+                        role_mentions.push(format!("<@&{}>", id));
+                    }
+                }
+            }
+            
+            // Create notification message
+            let notification = if !role_mentions.is_empty() {
+                format!("❌ {} Meeting scheduling failed due to insufficient availability.", 
+                       role_mentions.join(" "))
+            } else {
+                "❌ Meeting scheduling failed due to insufficient availability.".to_string()
+            };
+            
+            // Update the message to show the failure
+            component.message.edit(&ctx.ctx.http, |m| {
+                m.content(&notification)
+                    .embed(|e| {
+                        e.title("Not Enough Members Available")
+                            .description(description)
+                            .color(Color::RED)
+                            .footer(|f| f.text("Members who didn't select any time slots are considered unavailable"))
+                    })
+                    .components(|c| c) // Clear components
+            }).await?;
+        } else {
+            // Find the optimal meeting slot
+            if let Some((_day_idx, slot_info, attending_users)) = find_optimal_meeting_slot(&poll_clone, min_required_per_group) {
+                // Format the time
+                let tz = chrono_tz::Tz::from_str(&poll_clone.timezone).unwrap_or(chrono_tz::UTC);
+                let day_date = slot_info.start.with_timezone(&tz).format("%A, %B %d, %Y").to_string();
+                
+                // Create description for success message
+                let mut description = format!(
+                    "**{}**\n**{}**\n\n",
+                    day_date,
+                    slot_info.formatted_time
+                );
+                
+                // Add details about each group
+                description.push_str("**Group Attendance:**\n");
+                for (group_name, available, _unavailable, _, min_required) in groups_status {
+                    description.push_str(&format!(
+                        "• **{}**: {}/{} members available (minimum required: {}) ✅\n",
+                        group_name, 
+                        available, 
+                        min_required,
+                        min_required
+                    ));
+                }
+                
+                description.push_str("\n**Attendees:**\n");
+                for user_id in &attending_users {
+                    description.push_str(&format!("• <@{}>\n", user_id));
+                }
+                
+                // Get role mentions for notification
+                let mut role_mentions = Vec::new();
+                for group_name in &poll_clone.group_names {
+                    // Query to get the role ID for this group
+                    let role_query = sqlx::query(
+                        "SELECT role_id FROM discord_groups WHERE name = $1 AND server_id = $2"
+                    )
+                    .bind(group_name)
+                    .bind(component.guild_id.unwrap().to_string())
+                    .fetch_optional(&ctx.db_pool)
+                    .await;
+                    
+                    if let Ok(Some(row)) = role_query {
+                        if let Ok(Some(id)) = row.try_get::<Option<String>, _>("role_id") {
+                            role_mentions.push(format!("<@&{}>", id));
+                        }
+                    }
+                }
+                
+                // Create ping message for attendees and roles
+                let ping_message = {
+                    let mut message = "🔔 Meeting confirmed! ".to_string();
+                    
+                    // Add role pings
+                    if !role_mentions.is_empty() {
+                        message.push_str(&format!("{} ", role_mentions.join(" ")));
+                    }
+                    
+                    // Add individual attendee pings
+                    if !attending_users.is_empty() {
+                        message.push_str("Please mark your calendars!");
+                    } else {
+                        message.push_str("Please mark your calendars!");
+                    }
+                    
+                    message
+                };
+                
+                // Update the message to show the confirmation
+                component.message.edit(&ctx.ctx.http, |m| {
+                    m.content(&ping_message)
+                        .embed(|e| {
+                            e.title("Meeting Time Confirmed!")
+                                .description(description)
+                                .color(Color::DARK_GREEN)
+                                .footer(|f| f.text(format!(
+                                    "Slot duration: {} min • Timezone: {} • Successfully matched {} attendees",
+                                    poll_clone.slot_duration,
+                                    poll_clone.timezone,
+                                    attending_users.len()
+                                )))
+                        })
+                        .components(|c| c) // Clear components
+                }).await?;
+            } else {
+                // This should rarely happen, but handle the case where no optimal slot is found
+                // despite having enough votes
+                let notification = "❌ No suitable meeting time could be found despite having enough votes.";
+                
+                component.message.edit(&ctx.ctx.http, |m| {
+                    m.content(notification)
+                        .embed(|e| {
+                            e.title("No Suitable Meeting Time Found")
+                                .description("We could not find a time slot where enough members from each group are available. You may want to try again with different parameters or ask members to update their availability.")
+                                .color(Color::RED)
+                        })
+                        .components(|c| c) // Clear components
+                }).await?;
+            }
+        }
+    } else {
+        // Otherwise, update the message with the latest voting status
+        let summary_message = generate_summary_message(&poll_clone, min_required_per_group);
+        
+        component.message.edit(&ctx.ctx.http, |m| {
+            m.embed(|e| {
+                e.title("Meeting Time Proposal")
+                    .description(&summary_message)
+                    .color(Color::GOLD)
+                    .footer(|f| f.text(format!(
+                        "Min members per group: {} • Slot duration: {} min • Timezone: {}",
+                        min_required_per_group,
+                        poll_clone.slot_duration,
+                        poll_clone.timezone
+                    )))
+            })
+            .components(|c| {
+                c.create_action_row(|row| {
+                    // Edit votes button
+                    row.create_button(|b| {
+                        b.custom_id("open_voting")
+                            .label("Edit Your Availability")
+                            .style(serenity::model::application::component::ButtonStyle::Primary)
+                            .emoji('✏')
+                    })
+                    .create_button(|b| {
+                        b.custom_id("lock_votes")
+                            .label("Lock In My Votes")
+                            .style(serenity::model::application::component::ButtonStyle::Success)
+                            .emoji('🔒')
+                    })
+                })
+            })
+        }).await?;
+        
+        // Send an ephemeral confirmation message to the user that disappears immediately
+        component.create_followup_message(&ctx.ctx.http, |m| {
+            m.ephemeral(true)
+                .content("Your votes have been locked in!")
+        }).await?;
+    }
+    
+    Ok(())
 }
 
 /// Handle voting interactions (Yes/No)
@@ -1526,22 +2238,62 @@ async fn handle_match_confirm(
 async fn handle_prev_day(
     ctx: HandlerContext,
     component: &mut MessageComponentInteraction,
+    already_acknowledged: bool,
 ) -> Result<()> {
-    // Acknowledge the interaction first - this should be done before any processing
-    // to avoid "interaction has already been acknowledged" errors
-    let _ = component.create_interaction_response(&ctx.ctx.http, |r| {
-        r.kind(InteractionResponseType::DeferredUpdateMessage)
-    }).await;
-    // We use let _ to ignore errors, in case the interaction was already acknowledged
+    // Only try to acknowledge if not already done at the higher level
+    if !already_acknowledged {
+        match component.create_interaction_response(&ctx.ctx.http, |r| {
+            r.kind(InteractionResponseType::DeferredUpdateMessage)
+        }).await {
+            Ok(_) => {}, // Successfully acknowledged
+            Err(e) => {
+                // Log the error, but continue with the function
+                tracing::warn!("Failed to acknowledge interaction in prev_day: {}", e);
+            }
+        }
+    }
     
-    // Get the poll associated with this message
+    // Get the voter ID
+    let voter_id = component.user.id.to_string();
+    
+    // First get the poll message ID using a read lock to avoid borrowing issues
+    let poll_message_id = {
+        let polls = ctx.active_polls.read().await; // Use read lock for searching
+        
+        // First try direct message lookup
+        if polls.contains_key(&component.message.id) {
+            component.message.id
+        } else if already_acknowledged {
+            // If not found and this is an ephemeral message, find by voter ID
+            let result = polls.iter()
+                .find(|&(_, poll)| poll.slot_responses.contains_key(&voter_id))
+                .map(|(message_id, _)| *message_id);
+                
+            if let Some(id) = result {
+                id
+            } else {
+                return Err(eyre::eyre!("No active poll found for this user"));
+            }
+        } else {
+            return Err(eyre::eyre!("No active poll found for this message"));
+        }
+    };
+    
+    // Now get the actual poll with a write lock
     let mut polls = ctx.active_polls.write().await;
-    let poll = polls.get_mut(&component.message.id)
-        .ok_or_else(|| eyre::eyre!("No active poll found for this message"))?;
+    let poll = polls.get_mut(&poll_message_id)
+        .ok_or_else(|| eyre::eyre!("Poll not found for message ID"))?;
     
     // Verify we're not already on the first day
     if poll.current_day == 0 {
         // Already on first day, nothing to do
+        drop(polls);
+        
+        // If we're on the first day, update UI anyway to show that navigation is working
+        if already_acknowledged {
+            update_ephemeral_ui(ctx, component, poll_message_id).await?;
+        }
+        
         return Ok(());
     }
     
@@ -1552,569 +2304,45 @@ async fn handle_prev_day(
     let poll_clone = poll.clone();
     drop(polls);
     
-    // Update the message with the cloned data
-    update_time_slot_message(ctx, component, &poll_clone).await?;
-    
-    Ok(())
-}
-
-/// Handle "Next Day" button click
-async fn handle_next_day(
-    ctx: HandlerContext,
-    component: &mut MessageComponentInteraction,
-) -> Result<()> {
-    // Acknowledge the interaction first - this should be done before any processing
-    // to avoid "interaction has already been acknowledged" errors
-    let _ = component.create_interaction_response(&ctx.ctx.http, |r| {
-        r.kind(InteractionResponseType::DeferredUpdateMessage)
-    }).await;
-    // We use let _ to ignore errors, in case the interaction was already acknowledged
-    
-    // Get the poll associated with this message
-    let mut polls = ctx.active_polls.write().await;
-    let poll = polls.get_mut(&component.message.id)
-        .ok_or_else(|| eyre::eyre!("No active poll found for this message"))?;
-    
-    // Verify we're not already on the last day
-    if poll.current_day >= poll.day_slots.len() - 1 {
-        // Already on last day, nothing to do
-        return Ok(());
-    }
-    
-    // Go to next day
-    poll.current_day += 1;
-    
-    // Get a clone of the poll before releasing the lock
-    let poll_clone = poll.clone();
-    drop(polls);
-    
-    // Update the message with the cloned data
-    update_time_slot_message(ctx, component, &poll_clone).await?;
-    
-    Ok(())
-}
-
-/// Handle time slot toggle button click
-async fn handle_slot_toggle(
-    ctx: HandlerContext,
-    component: &mut MessageComponentInteraction,
-    slot_id: &str,
-) -> Result<()> {
-    // Get the voter ID
-    let voter_id = component.user.id.to_string();
-    
-    // Acknowledge the interaction first - this should be done before any processing
-    // to avoid "interaction has already been acknowledged" errors
-    let _ = component.create_interaction_response(&ctx.ctx.http, |r| {
-        r.kind(InteractionResponseType::DeferredUpdateMessage)
-    }).await;
-    // We use let _ to ignore errors, in case the interaction was already acknowledged
-    
-    // Get the poll associated with this message
-    let mut polls = ctx.active_polls.write().await;
-    let poll = polls.get_mut(&component.message.id)
-        .ok_or_else(|| eyre::eyre!("No active poll found for this message"))?;
-    
-    // Check if the user is an eligible voter (member of one of the selected groups)
-    let eligible_voters: Vec<String> = if poll.eligible_voters.is_empty() {
-        Vec::new()
+    // If already acknowledged (ephemeral response), use a different update approach
+    if already_acknowledged {
+        update_ephemeral_ui(ctx, component, poll_message_id).await?;
     } else {
-        poll.eligible_voters.split(',').map(|s| s.to_string()).collect()
-    };
-    
-    if !eligible_voters.contains(&voter_id) {
-        // Since we've already acknowledged the interaction above, use a follow-up message
-        let _ = component.create_followup_message(&ctx.ctx.http, |m| {
-            m.content("You are not a member of any of the groups in this poll, so you cannot vote.")
-                .ephemeral(true)
-        }).await;
-        
-        return Ok(());
-    }
-    
-    // Toggle this slot for the user
-    let user_slots = poll.slot_responses.entry(voter_id.clone()).or_insert_with(Vec::new);
-    
-    // Toggle - if slot is already selected, remove it; otherwise add it
-    if let Some(index) = user_slots.iter().position(|s| s == slot_id) {
-        // Remove the slot (deselect)
-        user_slots.remove(index);
-    } else {
-        // Add the slot (select)
-        user_slots.push(slot_id.to_string());
-    }
-    
-    // Get a clone of the poll before releasing the lock
-    let poll_clone = poll.clone();
-    drop(polls);
-    
-    // Update the message with the cloned data
-    update_time_slot_message(ctx, component, &poll_clone).await?;
-    
-    Ok(())
-}
-
-/// Handle "Select All" button click
-async fn handle_select_all_slots(
-    ctx: HandlerContext,
-    component: &mut MessageComponentInteraction,
-) -> Result<()> {
-    // Get the voter ID
-    let voter_id = component.user.id.to_string();
-    
-    // Acknowledge the interaction first - this should be done before any processing
-    // to avoid "interaction has already been acknowledged" errors
-    let _ = component.create_interaction_response(&ctx.ctx.http, |r| {
-        r.kind(InteractionResponseType::DeferredUpdateMessage)
-    }).await;
-    // We use let _ to ignore errors, in case the interaction was already acknowledged
-    
-    // Get the poll associated with this message
-    let mut polls = ctx.active_polls.write().await;
-    let poll = polls.get_mut(&component.message.id)
-        .ok_or_else(|| eyre::eyre!("No active poll found for this message"))?;
-    
-    // Check if the user is an eligible voter (member of one of the selected groups)
-    let eligible_voters: Vec<String> = if poll.eligible_voters.is_empty() {
-        Vec::new()
-    } else {
-        poll.eligible_voters.split(',').map(|s| s.to_string()).collect()
-    };
-    
-    if !eligible_voters.contains(&voter_id) {
-        // Since we've already acknowledged the interaction above, use a follow-up message
-        let _ = component.create_followup_message(&ctx.ctx.http, |m| {
-            m.content("You are not a member of any of the groups in this poll, so you cannot vote.")
-                .ephemeral(true)
-        }).await;
-        
-        return Ok(());
-    }
-    
-    // Get all slot IDs for the current day
-    let current_day_slots = match poll.day_slots.get(&poll.current_day) {
-        Some(slots) => slots,
-        None => {
-            return Ok(());
-        }
-    };
-    
-    // Select all slots for this day
-    let user_slots = poll.slot_responses.entry(voter_id.clone()).or_insert_with(Vec::new);
-    
-    // Add all slots from the current day that aren't already selected
-    for slot in current_day_slots {
-        if !user_slots.contains(&slot.id) {
-            user_slots.push(slot.id.clone());
-        }
-    }
-    
-    // Get a clone of the poll before releasing the lock
-    let poll_clone = poll.clone();
-    drop(polls);
-    
-    // Update the message with the cloned data
-    update_time_slot_message(ctx, component, &poll_clone).await?;
-    
-    Ok(())
-}
-
-/// Handle "Clear All" button click
-async fn handle_clear_all_slots(
-    ctx: HandlerContext,
-    component: &mut MessageComponentInteraction,
-) -> Result<()> {
-    // Get the voter ID
-    let voter_id = component.user.id.to_string();
-    
-    // Acknowledge the interaction first - this should be done before any processing
-    // to avoid "interaction has already been acknowledged" errors
-    let _ = component.create_interaction_response(&ctx.ctx.http, |r| {
-        r.kind(InteractionResponseType::DeferredUpdateMessage)
-    }).await;
-    // We use let _ to ignore errors, in case the interaction was already acknowledged
-    
-    // Get the poll associated with this message
-    let mut polls = ctx.active_polls.write().await;
-    let poll = polls.get_mut(&component.message.id)
-        .ok_or_else(|| eyre::eyre!("No active poll found for this message"))?;
-    
-    // Check if the user is an eligible voter (member of one of the selected groups)
-    let eligible_voters: Vec<String> = if poll.eligible_voters.is_empty() {
-        Vec::new()
-    } else {
-        poll.eligible_voters.split(',').map(|s| s.to_string()).collect()
-    };
-    
-    if !eligible_voters.contains(&voter_id) {
-        // Since we've already acknowledged the interaction above, use a follow-up message
-        let _ = component.create_followup_message(&ctx.ctx.http, |m| {
-            m.content("You are not a member of any of the groups in this poll, so you cannot vote.")
-                .ephemeral(true)
-        }).await;
-        
-        return Ok(());
-    }
-    
-    // Clear ALL slots for ALL days
-    // Just empty the user's selected slots completely
-    poll.slot_responses.insert(voter_id.clone(), Vec::new());
-    
-    // Get a clone of the poll before releasing the lock
-    let poll_clone = poll.clone();
-    drop(polls);
-    
-    // Update the message with the cloned data
-    update_time_slot_message(ctx, component, &poll_clone).await?;
-    
-    Ok(())
-}
-
-/// Handle "Submit Votes" button click
-/// This locks in the member's selected time slots.
-/// If a member submits with no selections, they are marked as unavailable.
-async fn handle_submit_votes(
-    ctx: HandlerContext,
-    component: &mut MessageComponentInteraction,
-) -> Result<()> {
-    // Get the voter ID
-    let voter_id = component.user.id.to_string();
-    
-    // Get the poll associated with this message
-    let mut polls = ctx.active_polls.write().await;
-    let poll = polls.get_mut(&component.message.id)
-        .ok_or_else(|| eyre::eyre!("No active poll found for this message"))?;
-    
-    // Check if the user is an eligible voter (member of one of the selected groups)
-    let eligible_voters: Vec<String> = if poll.eligible_voters.is_empty() {
-        Vec::new()
-    } else {
-        poll.eligible_voters.split(',').map(|s| s.to_string()).collect()
-    };
-    
-    if !eligible_voters.contains(&voter_id) {
-        // Acknowledge the interaction
-        component.create_interaction_response(&ctx.ctx.http, |r| {
-            r.kind(InteractionResponseType::ChannelMessageWithSource)
-                .interaction_response_data(|m| {
-                    m.content("You are not a member of any of the groups in this poll, so you cannot vote.")
-                        .ephemeral(true)
-                })
-        }).await?;
-        
-        return Ok(());
-    }
-    
-    // Acknowledge the interaction first - this should be done before any processing
-    let _ = component.create_interaction_response(&ctx.ctx.http, |r| {
-        r.kind(InteractionResponseType::DeferredUpdateMessage)
-    }).await;
-    // Note: We use let _ to ignore errors, in case the interaction was already acknowledged
-    
-    // Mark this user as having voted - an empty selection means they're unavailable
-    // If they didn't select any slots, they'll have an empty vector in slot_responses
-    if !poll.slot_responses.contains_key(&voter_id) {
-        poll.slot_responses.insert(voter_id.clone(), Vec::new());
-    }
-
-    // Confirm to the user that their votes have been submitted
-    let _ = component.create_followup_message(&ctx.ctx.http, |m| {
-        let selected_count = poll.slot_responses.get(&voter_id)
-            .map_or(0, |slots| slots.len());
-        
-        if selected_count > 0 {
-            m.content(format!("Your votes have been submitted! You selected {} time slots.", selected_count))
-        } else {
-            m.content("Your response has been recorded. You didn't select any time slots, so you're marked as unavailable.")
-        }
-        .ephemeral(true)
-    }).await;
-
-    // Get users who have voted
-    let voted_users: std::collections::HashSet<String> = poll.slot_responses.keys().cloned().collect();
-    
-    // Check if minimum requirements can be met with current votes
-    let mut min_requirements_possible = true;
-    let mut all_groups_have_enough = true;
-    let mut groups_status = Vec::new();
-    
-    for (idx, (_group_id, members)) in poll.group_members.iter().enumerate() {
-        let min_required = poll.min_per_group as usize;
-        
-        // Get members who selected at least one time slot (not just voted)
-        let available_count = members.iter()
-            .filter(|m| {
-                poll.slot_responses.get(*m)
-                    .map_or(false, |slots| !slots.is_empty())
-            })
-            .count();
-        
-        let remaining_count = members.len() - voted_users.intersection(&members.iter().cloned().collect()).count();
-        
-        // Keep track of the group's status for the message
-        let group_name = poll.group_names.get(idx)
-            .unwrap_or(&format!("Group {}", idx + 1))
-            .clone();
-        
-        // Is it still possible to reach the minimum required members?
-        let max_possible_available = available_count + remaining_count;
-        
-        // If we can't reach the minimum requirement even if all remaining members vote as available,
-        // then voting is effectively complete and we know the result will be negative
-        if max_possible_available < min_required {
-            min_requirements_possible = false;
-            groups_status.push((group_name, available_count, min_required, false));
-        } else {
-            // Otherwise, check if we've met the minimum already
-            let min_met = available_count >= min_required;
-            groups_status.push((group_name, available_count, min_required, min_met));
-            
-            if !min_met {
-                all_groups_have_enough = false;
-            }
-        }
-    }
-    
-    // If minimum requirements can't be met, or if all groups have enough votes and they've found an overlapping time slot,
-    // we can finish the voting process
-    if !min_requirements_possible || all_groups_have_enough {
-        // If requirements can't be met, there's no point in finding an optimal slot
-        if !min_requirements_possible {
-            // Show a message explaining why voting failed
-            let mut description = "**Voting Results**\n\n".to_string();
-            description.push_str("The meeting cannot be scheduled because not enough members are available.\n\n");
-            
-            // Add details about each group
-            description.push_str("**Group Status:**\n");
-            for (group_name, voted_count, min_required, _) in groups_status {
-                description.push_str(&format!(
-                    "• **{}**: {}/{} members voted (minimum required: {})\n",
-                    group_name, voted_count, min_required, min_required
-                ));
-            }
-            
-            // Get role mentions for status notification
-            let mut role_mentions = Vec::new();
-            for group_name in &poll.group_names {
-                // Query to get the role ID for this group
-                let role_query = sqlx::query(
-                    "SELECT role_id FROM discord_groups WHERE name = $1 AND server_id = $2"
-                )
-                .bind(group_name)
-                .bind(component.guild_id.unwrap().to_string())
-                .fetch_optional(&ctx.db_pool)
-                .await;
-                
-                if let Ok(Some(row)) = role_query {
-                    if let Ok(Some(id)) = row.try_get::<Option<String>, _>("role_id") {
-                        role_mentions.push(format!("<@&{}>", id));
-                    }
-                }
-            }
-            
-            // Create notification message
-            let notification = if !role_mentions.is_empty() {
-                format!("❌ {} Meeting scheduling failed due to insufficient availability.", 
-                       role_mentions.join(" "))
-            } else {
-                "❌ Meeting scheduling failed due to insufficient availability.".to_string()
-            };
-            
-            // Update the message to show the failure
-            component.message.edit(&ctx.ctx.http, |m| {
-                m.content(&notification)
-                    .embed(|e| {
-                        e.title("Not Enough Members Available")
-                            .description(description)
-                            .color(Color::RED)
-                            .footer(|f| f.text("Members who submitted without selecting any slots are considered unavailable"))
-                    })
-                    .components(|c| c) // Clear components
-            }).await?;
-            
-            // Remove the poll from active polls
-            polls.remove(&component.message.id);
-            return Ok(());
-        }
-        
-        // Otherwise, try to find an optimal meeting time
-        let optimal_slot = find_optimal_meeting_slot(poll);
-        
-        if let Some((_day_idx, slot_info, attending_users)) = optimal_slot {
-            // We found a good meeting time
-            // Format date for display
-            let tz = chrono_tz::Tz::from_str(&poll.timezone).unwrap_or(chrono_tz::UTC);
-            let day_date = slot_info.start.with_timezone(&tz).format("%A, %B %d, %Y").to_string();
-            
-            // Create description for the message
-            let mut description = format!(
-                "**{}**\n**{}**\n\n",
-                day_date,
-                slot_info.formatted_time
-            );
-            
-            // Add details about each group
-            description.push_str("**Group Attendance:**\n");
-            for (group_name, voted_count, min_required, min_met) in groups_status {
-                description.push_str(&format!(
-                    "• **{}**: {}/{} members (minimum required: {}) {}\n",
-                    group_name, 
-                    voted_count, 
-                    min_required,
-                    min_required,
-                    if min_met { "✅" } else { "❓" }
-                ));
-            }
-            
-            description.push_str("\n**Attendees:**\n");
-            for user_id in &attending_users {
-                description.push_str(&format!("• <@{}>\n", user_id));
-            }
-            
-            // Get role IDs for all groups to ping during announcement
-            let mut role_mentions = Vec::new();
-            for group_name in &poll.group_names {
-                // Query to get the role ID for this group
-                let role_query = sqlx::query(
-                    "SELECT role_id FROM discord_groups WHERE name = $1 AND server_id = $2"
-                )
-                .bind(group_name)
-                .bind(component.guild_id.unwrap().to_string())
-                .fetch_optional(&ctx.db_pool)
-                .await;
-                
-                if let Ok(Some(row)) = role_query {
-                    if let Ok(Some(id)) = row.try_get::<Option<String>, _>("role_id") {
-                        role_mentions.push(format!("<@&{}>", id));
-                    }
-                }
-            }
-            
-            // Create ping message for attendees and roles
-            let ping_message = {
-                let mut message = "🔔 Meeting confirmed! ".to_string();
-                
-                // Add role pings
-                if !role_mentions.is_empty() {
-                    message.push_str(&format!("{} ", role_mentions.join(" ")));
-                }
-                
-                // Add individual attendee pings
-                if !attending_users.is_empty() {
-                    message.push_str("- Please mark your calendars!");
-                } else {
-                    message.push_str("Please mark your calendars!");
-                }
-                
-                message
-            };
-            
-            // Update the message to show the confirmation
-            component.message.edit(&ctx.ctx.http, |m| {
-                m.content(&ping_message)
-                    .embed(|e| {
-                        e.title("Meeting Time Confirmed!")
-                            .description(description)
-                            .color(Color::DARK_GREEN)
-                            .footer(|f| f.text(format!(
-                                "Min members per group: {} • {} attendees • Timezone: {} • Only members who selected this slot are listed as attendees",
-                                poll.min_per_group,
-                                attending_users.len(),
-                                poll.timezone
-                            )))
-                    })
-                    .components(|c| c) // Clear components
-            }).await?;
-            
-            // Remove the poll from active polls
-            polls.remove(&component.message.id);
-        } else {
-            // No suitable meeting time found
-            // Get role mentions for notification
-            let mut role_mentions = Vec::new();
-            for group_name in &poll.group_names {
-                // Query to get the role ID for this group
-                let role_query = sqlx::query(
-                    "SELECT role_id FROM discord_groups WHERE name = $1 AND server_id = $2"
-                )
-                .bind(group_name)
-                .bind(component.guild_id.unwrap().to_string())
-                .fetch_optional(&ctx.db_pool)
-                .await;
-                
-                if let Ok(Some(row)) = role_query {
-                    if let Ok(Some(id)) = row.try_get::<Option<String>, _>("role_id") {
-                        role_mentions.push(format!("<@&{}>", id));
-                    }
-                }
-            }
-            
-            // Create notification message
-            let notification = if !role_mentions.is_empty() {
-                format!("❌ {} No suitable meeting time could be found.", 
-                       role_mentions.join(" "))
-            } else {
-                "❌ No suitable meeting time could be found.".to_string()
-            };
-            
-            component.message.edit(&ctx.ctx.http, |m| {
-                m.content(&notification)
-                    .embed(|e| {
-                        e.title("No Suitable Meeting Time Found")
-                            .description("We could not find a time slot where enough members from each group are available. You may want to try again with different parameters or ask members to update their availability.")
-                            .color(Color::RED)
-                    })
-                    .components(|c| c) // Clear components
-            }).await?;
-            
-            // Remove the poll from active polls
-            polls.remove(&component.message.id);
-        }
-    } else {
-        // Voting is still in progress, update the UI and let people continue voting
-        // Close the polls lock before calling update_time_slot_message
-        let poll_clone = poll.clone();
-        // Drop the write lock to avoid borrow issues
-        drop(polls);
-        
-        // Now update the message with the cloned poll data
+        // Update the message with the cloned data using normal flow
         update_time_slot_message(ctx, component, &poll_clone).await?;
     }
     
     Ok(())
 }
 
-/// Update the time slot message UI
-async fn update_time_slot_message(
+/// Helper function to update an ephemeral message UI based on an active poll
+async fn update_ephemeral_ui(
     ctx: HandlerContext,
     component: &mut MessageComponentInteraction,
-    poll: &super::ActivePoll,
+    poll_message_id: serenity::model::id::MessageId
 ) -> Result<()> {
-    // Format the time slot message
-    let time_slot_message = format_time_slots(poll);
+    // Get the poll by message ID
+    let polls = ctx.active_polls.read().await;
+    let poll = polls.get(&poll_message_id)
+        .ok_or_else(|| eyre::eyre!("Poll not found for message ID"))?;
     
-    // Get the user's selected slots
+    // Format time slots for personal interface
     let voter_id = component.user.id.to_string();
+    let time_slot_message = format_personal_time_slots(poll, &voter_id);
     let user_selected_slots = poll.slot_responses.get(&voter_id).cloned().unwrap_or_default();
     
-    // Instead of using the interaction response, directly edit the message
-    // This avoids the "interaction already acknowledged" error
-    component.message.edit(&ctx.ctx.http, |m| {
+    // Use edit_original_interaction_response because we already acknowledged
+    component.edit_original_interaction_response(&ctx.ctx.http, |m| {
         m.embed(|e| {
-            e.title(format!("Vote on Your Availability - Day {} of {}", 
-                          poll.current_day + 1, 
-                          poll.day_slots.len()))
-                .description(&time_slot_message)
-                .color(Color::GOLD)
-                .footer(|f| f.text(format!(
-                    "Min members per group: {} • Slot duration: {} min • Timezone: {}",
-                    poll.min_per_group,
-                    poll.slot_duration,
-                    poll.timezone
-                )))
+            e.title(format!("Your Availability - Day {} of {}", 
+                   poll.current_day + 1, 
+                   poll.day_slots.len()))
+             .description(&time_slot_message)
+             .color(Color::GOLD)
+             .footer(|f| f.text("Select all times when you are available"))
         })
         .components(|c| {
-            // Add time slot selection buttons
+            // Add time slot selection buttons with correct vote count and selection status
             if let Some(slots) = poll.day_slots.get(&poll.current_day) {
                 for chunk in slots.chunks(5) {
                     c.create_action_row(|row| {
@@ -2122,7 +2350,7 @@ async fn update_time_slot_message(
                             // Check if this slot is selected by the current user
                             let is_selected = user_selected_slots.contains(&slot.id);
                             
-                            // Count votes for this slot
+                            // Count total votes for this slot
                             let vote_count = poll.slot_responses.values()
                                 .filter(|selected_slots| selected_slots.contains(&slot.id))
                                 .count();
@@ -2159,11 +2387,10 @@ async fn update_time_slot_message(
                         .style(serenity::model::application::component::ButtonStyle::Primary)
                         .disabled(poll.current_day >= poll.day_slots.len() - 1)
                 });
-                
                 row
             });
             
-            // Add select all / clear buttons
+            // Add select all / clear / submit buttons
             c.create_action_row(|row| {
                 row.create_button(|b| {
                     b.custom_id("select_all")
@@ -2179,7 +2406,18 @@ async fn update_time_slot_message(
                     b.custom_id("submit_votes")
                         .label("Submit Votes")
                         .style(serenity::model::application::component::ButtonStyle::Primary)
-                })
+                });
+                row
+            });
+            
+            // Add return button
+            c.create_action_row(|row| {
+                row.create_button(|b| {
+                    b.custom_id("return_to_main")
+                        .label("Return to Main Message")
+                        .style(serenity::model::application::component::ButtonStyle::Secondary)
+                });
+                row
             })
         })
     }).await?;
@@ -2187,19 +2425,880 @@ async fn update_time_slot_message(
     Ok(())
 }
 
+/// Handle "Next Day" button click
+async fn handle_next_day(
+    ctx: HandlerContext,
+    component: &mut MessageComponentInteraction,
+    already_acknowledged: bool,
+) -> Result<()> {
+    // Only try to acknowledge if not already done at the higher level
+    if !already_acknowledged {
+        match component.create_interaction_response(&ctx.ctx.http, |r| {
+            r.kind(InteractionResponseType::DeferredUpdateMessage)
+        }).await {
+            Ok(_) => {}, // Successfully acknowledged
+            Err(e) => {
+                // Log the error, but continue with the function
+                tracing::warn!("Failed to acknowledge interaction in next_day: {}", e);
+            }
+        }
+    }
+    
+    // Get the voter ID
+    let voter_id = component.user.id.to_string();
+    
+    // First get the poll message ID using a read lock to avoid borrowing issues
+    let poll_message_id = {
+        let polls = ctx.active_polls.read().await; // Use read lock for searching
+        
+        // First try direct message lookup
+        if polls.contains_key(&component.message.id) {
+            component.message.id
+        } else if already_acknowledged {
+            // If not found and this is an ephemeral message, find by voter ID
+            let result = polls.iter()
+                .find(|&(_, poll)| poll.slot_responses.contains_key(&voter_id))
+                .map(|(message_id, _)| *message_id);
+                
+            if let Some(id) = result {
+                id
+            } else {
+                return Err(eyre::eyre!("No active poll found for this user"));
+            }
+        } else {
+            return Err(eyre::eyre!("No active poll found for this message"));
+        }
+    };
+    
+    // Now get the actual poll with a write lock
+    let mut polls = ctx.active_polls.write().await;
+    let poll = polls.get_mut(&poll_message_id)
+        .ok_or_else(|| eyre::eyre!("Poll not found for message ID"))?;
+    
+    // Verify we're not already on the last day
+    if poll.current_day >= poll.day_slots.len() - 1 {
+        // Already on last day, nothing to do
+        drop(polls);
+        
+        // If we're on the last day, update UI anyway to show navigation is working
+        if already_acknowledged {
+            update_ephemeral_ui(ctx, component, poll_message_id).await?;
+        }
+        
+        return Ok(());
+    }
+    
+    // Go to next day
+    poll.current_day += 1;
+    
+    // Get a clone of the poll before releasing the lock
+    let poll_clone = poll.clone();
+    drop(polls);
+    
+    // If already acknowledged (ephemeral response), use a different update approach
+    if already_acknowledged {
+        update_ephemeral_ui(ctx, component, poll_message_id).await?;
+    } else {
+        // Update the message with the cloned data using normal flow
+        update_time_slot_message(ctx, component, &poll_clone).await?;
+    }
+    
+    Ok(())
+}
+
+/// Handle time slot toggle button click
+async fn handle_slot_toggle(
+    ctx: HandlerContext,
+    component: &mut MessageComponentInteraction,
+    slot_id: &str,
+    already_acknowledged: bool,
+) -> Result<()> {
+    // Get the voter ID
+    let voter_id = component.user.id.to_string();
+    
+    // Only acknowledge if not already done
+    if !already_acknowledged {
+        match component.create_interaction_response(&ctx.ctx.http, |r| {
+            r.kind(InteractionResponseType::DeferredUpdateMessage)
+        }).await {
+            Ok(_) => {}, // Successfully acknowledged
+            Err(e) => {
+                // Log the error, but continue with the function
+                tracing::warn!("Failed to acknowledge interaction in slot_toggle: {}", e);
+            }
+        }
+    }
+    
+    // First get the poll message ID using a read lock to avoid borrowing issues
+    let poll_message_id = {
+        let polls = ctx.active_polls.read().await; // Use read lock for searching
+        
+        // First try direct message lookup
+        if polls.contains_key(&component.message.id) {
+            component.message.id
+        } else {
+            // If not found, look for a poll with this user's responses
+            let result = polls.iter()
+                .find(|&(_, poll)| poll.slot_responses.contains_key(&voter_id))
+                .map(|(message_id, _)| *message_id);
+                
+            if let Some(id) = result {
+                id
+            } else {
+                return Err(eyre::eyre!("No active poll found for this user"));
+            }
+        }
+    };
+    
+    // Now get the actual poll with a write lock
+    let mut polls = ctx.active_polls.write().await;
+    let poll = polls.get_mut(&poll_message_id)
+        .ok_or_else(|| eyre::eyre!("Poll not found for message ID"))?;
+    
+    // Check if the user is an eligible voter
+    let eligible_voters: Vec<String> = if poll.eligible_voters.is_empty() {
+        Vec::new()
+    } else {
+        poll.eligible_voters.split(',').map(|s| s.to_string()).collect()
+    };
+    
+    if !eligible_voters.contains(&voter_id) {
+        drop(polls);
+        
+        // Send error as a follow-up if already acknowledged, otherwise as a response
+        if already_acknowledged {
+            let _ = component.create_followup_message(&ctx.ctx.http, |m| {
+                m.content("You are not a member of any of the groups in this poll, so you cannot vote.")
+                    .ephemeral(true)
+            }).await;
+        } else {
+            let _ = component.create_interaction_response(&ctx.ctx.http, |r| {
+                r.kind(InteractionResponseType::ChannelMessageWithSource)
+                    .interaction_response_data(|m| {
+                        m.content("You are not a member of any of the groups in this poll, so you cannot vote.")
+                            .ephemeral(true)
+                    })
+            }).await;
+        }
+        
+        return Ok(());
+    }
+    
+    // Toggle this slot for the user
+    let user_slots = poll.slot_responses.entry(voter_id.clone()).or_insert_with(Vec::new);
+    
+    // Toggle - if slot is already selected, remove it; otherwise add it
+    if let Some(index) = user_slots.iter().position(|s| s == slot_id) {
+        // Remove the slot (deselect)
+        user_slots.remove(index);
+    } else {
+        // Add the slot (select)
+        user_slots.push(slot_id.to_string());
+    }
+    
+    // Get a clone of the poll before releasing the lock
+    let poll_clone = poll.clone();
+    drop(polls);
+    
+    // Update the UI based on whether this is an ephemeral message or main message
+    if already_acknowledged {
+        // For already acknowledged interactions, use edit_original_interaction_response
+        update_ephemeral_ui(ctx, component, poll_message_id).await?;
+    } else {
+        // For main message interactions, use the regular update function
+        update_time_slot_message(ctx, component, &poll_clone).await?;
+    }
+    
+    Ok(())
+}
+
+/// Handle "Select All" button click
+async fn handle_select_all_slots(
+    ctx: HandlerContext,
+    component: &mut MessageComponentInteraction,
+    already_acknowledged: bool,
+) -> Result<()> {
+    // Get the voter ID
+    let voter_id = component.user.id.to_string();
+    
+    // Only acknowledge if not already done
+    if !already_acknowledged {
+        match component.create_interaction_response(&ctx.ctx.http, |r| {
+            r.kind(InteractionResponseType::DeferredUpdateMessage)
+        }).await {
+            Ok(_) => {}, // Successfully acknowledged
+            Err(e) => {
+                // Log the error, but continue with the function
+                tracing::warn!("Failed to acknowledge interaction in select_all: {}", e);
+            }
+        }
+    }
+    
+    // First get the poll message ID using a read lock to avoid borrowing issues
+    let poll_message_id = {
+        let polls = ctx.active_polls.read().await; // Use read lock for searching
+        
+        // First try direct message lookup
+        if polls.contains_key(&component.message.id) {
+            component.message.id
+        } else {
+            // If not found, look for a poll with this user's responses
+            let result = polls.iter()
+                .find(|&(_, poll)| poll.slot_responses.contains_key(&voter_id))
+                .map(|(message_id, _)| *message_id);
+                
+            if let Some(id) = result {
+                id
+            } else {
+                drop(polls);
+                return Err(eyre::eyre!("No active poll found for this user"));
+            }
+        }
+    };
+    
+    // Now get the actual poll with a write lock
+    let mut polls = ctx.active_polls.write().await;
+    let poll = polls.get_mut(&poll_message_id)
+        .ok_or_else(|| eyre::eyre!("Poll not found for message ID"))?;
+    
+    // Check if the user is an eligible voter (member of one of the selected groups)
+    let eligible_voters: Vec<String> = if poll.eligible_voters.is_empty() {
+        Vec::new()
+    } else {
+        poll.eligible_voters.split(',').map(|s| s.to_string()).collect()
+    };
+    
+    if !eligible_voters.contains(&voter_id) {
+        drop(polls);
+        
+        // Send error as a follow-up if already acknowledged, otherwise as a response
+        if already_acknowledged {
+            let _ = component.create_followup_message(&ctx.ctx.http, |m| {
+                m.content("You are not a member of any of the groups in this poll, so you cannot vote.")
+                    .ephemeral(true)
+            }).await;
+        } else {
+            let _ = component.create_interaction_response(&ctx.ctx.http, |r| {
+                r.kind(InteractionResponseType::ChannelMessageWithSource)
+                    .interaction_response_data(|m| {
+                        m.content("You are not a member of any of the groups in this poll, so you cannot vote.")
+                            .ephemeral(true)
+                    })
+            }).await;
+        }
+        
+        return Ok(());
+    }
+    
+    // Get all slot IDs for the current day
+    let current_day_slots = match poll.day_slots.get(&poll.current_day) {
+        Some(slots) => slots,
+        None => {
+            drop(polls);
+            return Ok(());
+        }
+    };
+    
+    // Select all slots for this day
+    let user_slots = poll.slot_responses.entry(voter_id.clone()).or_insert_with(Vec::new);
+    
+    // Add all slots from the current day that aren't already selected
+    for slot in current_day_slots {
+        if !user_slots.contains(&slot.id) {
+            user_slots.push(slot.id.clone());
+        }
+    }
+    
+    // Get a clone of the poll before releasing the lock
+    let poll_clone = poll.clone();
+    drop(polls);
+    
+    // Update the UI based on whether this is an ephemeral message or main message
+    if already_acknowledged {
+        // For already acknowledged interactions, use edit_original_interaction_response
+        update_ephemeral_ui(ctx, component, poll_message_id).await?;
+    } else {
+        // For main message interactions, use the regular update function
+        update_time_slot_message(ctx, component, &poll_clone).await?;
+    }
+    
+    Ok(())
+}
+
+/// Handle "Clear All" button click
+async fn handle_clear_all_slots(
+    ctx: HandlerContext,
+    component: &mut MessageComponentInteraction,
+    already_acknowledged: bool,
+) -> Result<()> {
+    // Get the voter ID
+    let voter_id = component.user.id.to_string();
+    
+    // Only acknowledge if not already done
+    if !already_acknowledged {
+        match component.create_interaction_response(&ctx.ctx.http, |r| {
+            r.kind(InteractionResponseType::DeferredUpdateMessage)
+        }).await {
+            Ok(_) => {}, // Successfully acknowledged
+            Err(e) => {
+                // Log the error, but continue with the function
+                tracing::warn!("Failed to acknowledge interaction in clear_all: {}", e);
+            }
+        }
+    }
+    
+    // First get the poll message ID using a read lock to avoid borrowing issues
+    let poll_message_id = {
+        let polls = ctx.active_polls.read().await; // Use read lock for searching
+        
+        // First try direct message lookup
+        if polls.contains_key(&component.message.id) {
+            component.message.id
+        } else {
+            // If not found, look for a poll with this user's responses
+            let result = polls.iter()
+                .find(|&(_, poll)| poll.slot_responses.contains_key(&voter_id))
+                .map(|(message_id, _)| *message_id);
+                
+            if let Some(id) = result {
+                id
+            } else {
+                drop(polls);
+                return Err(eyre::eyre!("No active poll found for this user"));
+            }
+        }
+    };
+    
+    // Now get the actual poll with a write lock
+    let mut polls = ctx.active_polls.write().await;
+    let poll = polls.get_mut(&poll_message_id)
+        .ok_or_else(|| eyre::eyre!("Poll not found for message ID"))?;
+    
+    // Check if the user is an eligible voter (member of one of the selected groups)
+    let eligible_voters: Vec<String> = if poll.eligible_voters.is_empty() {
+        Vec::new()
+    } else {
+        poll.eligible_voters.split(',').map(|s| s.to_string()).collect()
+    };
+    
+    if !eligible_voters.contains(&voter_id) {
+        drop(polls);
+        
+        // Send error as a follow-up if already acknowledged, otherwise as a response
+        if already_acknowledged {
+            let _ = component.create_followup_message(&ctx.ctx.http, |m| {
+                m.content("You are not a member of any of the groups in this poll, so you cannot vote.")
+                    .ephemeral(true)
+            }).await;
+        } else {
+            let _ = component.create_interaction_response(&ctx.ctx.http, |r| {
+                r.kind(InteractionResponseType::ChannelMessageWithSource)
+                    .interaction_response_data(|m| {
+                        m.content("You are not a member of any of the groups in this poll, so you cannot vote.")
+                            .ephemeral(true)
+                    })
+            }).await;
+        }
+        
+        return Ok(());
+    }
+    
+    // Clear ALL slots for ALL days
+    // Just empty the user's selected slots completely
+    poll.slot_responses.insert(voter_id.clone(), Vec::new());
+    
+    // Get a clone of the poll before releasing the lock
+    let poll_clone = poll.clone();
+    drop(polls);
+    
+    // Update the UI based on whether this is an ephemeral message or main message
+    if already_acknowledged {
+        // For already acknowledged interactions, use edit_original_interaction_response
+        update_ephemeral_ui(ctx, component, poll_message_id).await?;
+    } else {
+        // For main message interactions, use the regular update function
+        update_time_slot_message(ctx, component, &poll_clone).await?;
+    }
+    
+    Ok(())
+}
+
+/// Handle "Submit Votes" button click
+/// This submits the user's selected time slots but does not lock them in yet
+async fn handle_submit_votes(
+    ctx: HandlerContext,
+    component: &mut MessageComponentInteraction,
+) -> Result<()> {
+    // Get the voter ID
+    let voter_id = component.user.id.to_string();
+    
+    // For ephemeral messages, we need to find the main message ID
+    let mut polls = ctx.active_polls.write().await;
+    
+    // Find the main message ID by scanning for which poll has this user with selections
+    let mut main_message_id = None;
+    
+    for (message_id, poll) in polls.iter() {
+        if poll.slot_responses.contains_key(&voter_id) {
+            main_message_id = Some(*message_id);
+            break;
+        }
+    }
+    
+    let poll_message_id = main_message_id.ok_or_else(|| eyre::eyre!("Could not find associated poll"))?;
+    
+    // Now get the poll by message ID
+    let poll = polls.get_mut(&poll_message_id)
+        .ok_or_else(|| eyre::eyre!("No active poll found for this user"))?;
+    
+    // Check if the user is an eligible voter
+    let eligible_voters: Vec<String> = if poll.eligible_voters.is_empty() {
+        Vec::new()
+    } else {
+        poll.eligible_voters.split(',').map(|s| s.to_string()).collect()
+    };
+    
+    if !eligible_voters.contains(&voter_id) {
+        // Try to acknowledge the interaction
+        match component.create_interaction_response(&ctx.ctx.http, |r| {
+            r.kind(InteractionResponseType::ChannelMessageWithSource)
+                .interaction_response_data(|m| {
+                    m.content("You are not a member of any of the groups in this poll, so you cannot vote.")
+                        .ephemeral(true)
+                })
+        }).await {
+            Ok(_) => {},
+            Err(e) => {
+                // Log the error and try a followup message instead
+                tracing::warn!("Failed to send error response: {}", e);
+                let _ = component.create_followup_message(&ctx.ctx.http, |m| {
+                    m.content("You are not a member of any of the groups in this poll, so you cannot vote.")
+                        .ephemeral(true)
+                }).await;
+            }
+        }
+        
+        drop(polls);
+        return Ok(());
+    }
+    
+    // Try to acknowledge the interaction
+    match component.create_interaction_response(&ctx.ctx.http, |r| {
+        r.kind(InteractionResponseType::DeferredUpdateMessage)
+    }).await {
+        Ok(_) => {}, // Successfully acknowledged
+        Err(e) => {
+            // Log the error, but continue with the function
+            tracing::warn!("Failed to acknowledge interaction: {}", e);
+        }
+    }
+    
+    // Get a clone of the poll for updating the UI
+    let poll_clone = poll.clone();
+    drop(polls);
+    
+    // Update the ephemeral message with confirmation
+    let selected_count = poll_clone.slot_responses.get(&voter_id)
+        .map_or(0, |slots| slots.len());
+        
+    let time_slot_message = format_personal_time_slots(&poll_clone, &voter_id);
+    
+    // Try to update the ephemeral message with the updated vote selections
+    let edit_result = component.message.edit(&ctx.ctx.http, |m| {
+        m.embed(|e| {
+            e.title(format!("Your Availability - Day {} of {}", 
+                          poll_clone.current_day + 1, 
+                          poll_clone.day_slots.len()))
+                .description(&time_slot_message)
+                .color(Color::GOLD)
+                .footer(|f| f.text(format!(
+                    "You have selected {} time slots in total. Return to the main message to lock in your votes.",
+                    selected_count
+                )))
+        })
+        .components(|c| {
+            // Add time slot selection buttons with correct vote count and selection status
+            if let Some(slots) = poll_clone.day_slots.get(&poll_clone.current_day) {
+                for chunk in slots.chunks(5) {
+                    c.create_action_row(|row| {
+                        for slot in chunk {
+                            // Check if this slot is selected by the current user
+                            let user_selections = poll_clone.slot_responses.get(&voter_id).cloned().unwrap_or_default();
+                            let is_selected = user_selections.contains(&slot.id);
+                            
+                            // Count total votes for this slot
+                            let vote_count = poll_clone.slot_responses.values()
+                                .filter(|selected_slots| selected_slots.contains(&slot.id))
+                                .count();
+                                
+                            row.create_button(|b| {
+                                b.custom_id(format!("slot_{}", slot.id))
+                                    .label(format!("{} [{}]", &slot.formatted_time, vote_count))
+                                    .style(if is_selected {
+                                        serenity::model::application::component::ButtonStyle::Success // Green for selected
+                                    } else {
+                                        serenity::model::application::component::ButtonStyle::Secondary // Neutral/gray for not selected
+                                    })
+                            });
+                        }
+                        row
+                    });
+                }
+            }
+            
+            // Add navigation and utility buttons
+            c.create_action_row(|row| {
+                // Previous day button
+                row.create_button(|b| {
+                    b.custom_id("prev_day")
+                        .label("◀️ Previous Day")
+                        .style(serenity::model::application::component::ButtonStyle::Primary)
+                        .disabled(poll_clone.current_day == 0)
+                });
+                
+                // Next day button
+                row.create_button(|b| {
+                    b.custom_id("next_day")
+                        .label("Next Day ▶️")
+                        .style(serenity::model::application::component::ButtonStyle::Primary)
+                        .disabled(poll_clone.current_day >= poll_clone.day_slots.len() - 1)
+                });
+                row
+            });
+            
+            // Add select all / clear / submit buttons
+            c.create_action_row(|row| {
+                row.create_button(|b| {
+                    b.custom_id("select_all")
+                        .label("Select All")
+                        .style(serenity::model::application::component::ButtonStyle::Success)
+                })
+                .create_button(|b| {
+                    b.custom_id("clear_all")
+                        .label("Clear All Days")
+                        .style(serenity::model::application::component::ButtonStyle::Danger)
+                })
+                .create_button(|b| {
+                    b.custom_id("submit_votes")
+                        .label("Save Selections")
+                        .style(serenity::model::application::component::ButtonStyle::Primary)
+                })
+            });
+            
+            // Add return button
+            c.create_action_row(|row| {
+                row.create_button(|b| {
+                    b.custom_id("return_to_main")
+                        .label("Return to Main Message")
+                        .style(serenity::model::application::component::ButtonStyle::Secondary)
+                })
+            })
+        })
+    }).await;
+    
+    // If editing failed, try to send a followup instead
+    if let Err(e) = edit_result {
+        tracing::warn!("Failed to edit message: {}", e);
+        let _ = component.create_followup_message(&ctx.ctx.http, |m| {
+            m.content(format!("Your votes have been saved. You selected {} time slots. Return to the main message to lock in your votes.", selected_count))
+                .ephemeral(true)
+        }).await;
+    }
+    
+    // Try to update the main message with updated vote counts
+    let main_message = serenity::model::id::MessageId(poll_message_id.0);
+    if let Ok(mut message) = ctx.ctx.http.get_message(component.channel_id.0, main_message.0).await {
+        let summary_message = generate_summary_message(&poll_clone, 6); // Default to 6 for min required
+        
+        match message.edit(&ctx.ctx.http, |m| {
+            m.embed(|e| {
+                e.title("Meeting Time Proposal")
+                    .description(&summary_message)
+                    .color(Color::GOLD)
+                    .footer(|f| f.text(format!(
+                        "Min members per group: {} • Slot duration: {} min • Timezone: {}",
+                        6, // Default to 6 for min required
+                        poll_clone.slot_duration,
+                        poll_clone.timezone
+                    )))
+            })
+            .components(|c| {
+                c.create_action_row(|row| {
+                    // Edit votes button
+                    row.create_button(|b| {
+                        b.custom_id("open_voting")
+                            .label("Edit Your Availability")
+                            .style(serenity::model::application::component::ButtonStyle::Primary)
+                            .emoji('✏')
+                    })
+                    .create_button(|b| {
+                        b.custom_id("lock_votes")
+                            .label("Lock In My Votes")
+                            .style(serenity::model::application::component::ButtonStyle::Success)
+                            .emoji('🔒')
+                    })
+                })
+            })
+        }).await {
+            Ok(_) => {},
+            Err(e) => {
+                tracing::warn!("Failed to update main message: {}", e);
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+/// Update the time slot message UI 
+async fn update_time_slot_message(
+    ctx: HandlerContext,
+    component: &mut MessageComponentInteraction,
+    poll: &super::ActivePoll,
+) -> Result<()> {
+    // Format the time slot message
+    let time_slot_message = format_time_slots(poll);
+    
+    // Get the user's selected slots
+    let voter_id = component.user.id.to_string();
+    let user_selected_slots = poll.slot_responses.get(&voter_id).cloned().unwrap_or_default();
+    
+    // Try to update the message with direct interaction response first
+    let response_result = component.create_interaction_response(&ctx.ctx.http, |r| {
+        r.kind(InteractionResponseType::UpdateMessage)
+            .interaction_response_data(|m| {
+                // Set up the embed
+                m.embed(|e| {
+                    e.title(format!("Vote on Your Availability - Day {} of {}", 
+                        poll.current_day + 1, 
+                        poll.day_slots.len()))
+                    .description(&time_slot_message)
+                    .color(Color::GOLD)
+                    .footer(|f| f.text(format!(
+                        "Min members per group: {} • Slot duration: {} min • Timezone: {}",
+                        poll.min_per_group,
+                        poll.slot_duration,
+                        poll.timezone
+                    )))
+                });
+                
+                // Add time slot selection buttons
+                if let Some(slots) = poll.day_slots.get(&poll.current_day) {
+                    for chunk in slots.chunks(5) {
+                        m.components(|c| {
+                            c.create_action_row(|row| {
+                                for slot in chunk {
+                                    // Check if this slot is selected by the current user
+                                    let is_selected = user_selected_slots.contains(&slot.id);
+                                    
+                                    // Count votes for this slot
+                                    let vote_count = poll.slot_responses.values()
+                                        .filter(|selected_slots| selected_slots.contains(&slot.id))
+                                        .count();
+                                    
+                                    row.create_button(|b| {
+                                        b.custom_id(format!("slot_{}", slot.id))
+                                            .label(format!("{} [{}]", &slot.formatted_time, vote_count))
+                                            .style(if is_selected {
+                                                serenity::model::application::component::ButtonStyle::Success // Green for selected
+                                            } else {
+                                                serenity::model::application::component::ButtonStyle::Secondary // Neutral/gray for not selected
+                                            })
+                                    });
+                                }
+                                row
+                            })
+                        });
+                    }
+                }
+                
+                // Add navigation buttons
+                m.components(|c| {
+                    c.create_action_row(|row| {
+                        // Previous day button
+                        row.create_button(|b| {
+                            b.custom_id("prev_day")
+                                .label("◀️ Previous Day")
+                                .style(serenity::model::application::component::ButtonStyle::Primary)
+                                .disabled(poll.current_day == 0)
+                        });
+                        
+                        // Next day button
+                        row.create_button(|b| {
+                            b.custom_id("next_day")
+                                .label("Next Day ▶️")
+                                .style(serenity::model::application::component::ButtonStyle::Primary)
+                                .disabled(poll.current_day >= poll.day_slots.len() - 1)
+                        });
+                        
+                        row
+                    })
+                });
+                
+                // Add select all / clear / submit buttons
+                m.components(|c| {
+                    c.create_action_row(|row| {
+                        row.create_button(|b| {
+                            b.custom_id("select_all")
+                                .label("Select All")
+                                .style(serenity::model::application::component::ButtonStyle::Success)
+                        })
+                        .create_button(|b| {
+                            b.custom_id("clear_all")
+                                .label("Clear All Days")
+                                .style(serenity::model::application::component::ButtonStyle::Danger)
+                        })
+                        .create_button(|b| {
+                            b.custom_id("submit_votes")
+                                .label("Submit Votes")
+                                .style(serenity::model::application::component::ButtonStyle::Primary)
+                        });
+                        row
+                    })
+                });
+                
+                m
+            })
+    }).await;
+    
+    // If direct interaction response fails, try to edit the original response
+    if let Err(e) = response_result {
+        tracing::warn!("Failed to use direct interaction response: {}", e);
+        
+        // Try to edit the original response
+        let edit_result = component.edit_original_interaction_response(&ctx.ctx.http, |m| {
+            // Set up the embed
+            m.embed(|e| {
+                e.title(format!("Vote on Your Availability - Day {} of {}", 
+                    poll.current_day + 1, 
+                    poll.day_slots.len()))
+                .description(&time_slot_message)
+                .color(Color::GOLD)
+                .footer(|f| f.text(format!(
+                    "Min members per group: {} • Slot duration: {} min • Timezone: {}",
+                    poll.min_per_group,
+                    poll.slot_duration,
+                    poll.timezone
+                )))
+            });
+            
+            // Clear any existing components and add new ones
+            m.components(|c| {
+                c.set_action_rows(Vec::new());
+                
+                // Add time slot selection buttons
+                if let Some(slots) = poll.day_slots.get(&poll.current_day) {
+                    for chunk in slots.chunks(5) {
+                        c.create_action_row(|row| {
+                            for slot in chunk {
+                                // Check if this slot is selected by the current user
+                                let is_selected = user_selected_slots.contains(&slot.id);
+                                
+                                // Count votes for this slot
+                                let vote_count = poll.slot_responses.values()
+                                    .filter(|selected_slots| selected_slots.contains(&slot.id))
+                                    .count();
+                                
+                                row.create_button(|b| {
+                                    b.custom_id(format!("slot_{}", slot.id))
+                                        .label(format!("{} [{}]", &slot.formatted_time, vote_count))
+                                        .style(if is_selected {
+                                            serenity::model::application::component::ButtonStyle::Success // Green for selected
+                                        } else {
+                                            serenity::model::application::component::ButtonStyle::Secondary // Neutral/gray for not selected
+                                        })
+                                });
+                            }
+                            row
+                        });
+                    }
+                }
+                
+                // Add navigation buttons
+                c.create_action_row(|row| {
+                    // Previous day button
+                    row.create_button(|b| {
+                        b.custom_id("prev_day")
+                            .label("◀️ Previous Day")
+                            .style(serenity::model::application::component::ButtonStyle::Primary)
+                            .disabled(poll.current_day == 0)
+                    });
+                    
+                    // Next day button
+                    row.create_button(|b| {
+                        b.custom_id("next_day")
+                            .label("Next Day ▶️")
+                            .style(serenity::model::application::component::ButtonStyle::Primary)
+                            .disabled(poll.current_day >= poll.day_slots.len() - 1)
+                    });
+                    
+                    row
+                });
+                
+                // Add select all / clear / submit buttons
+                c.create_action_row(|row| {
+                    row.create_button(|b| {
+                        b.custom_id("select_all")
+                            .label("Select All")
+                            .style(serenity::model::application::component::ButtonStyle::Success)
+                    })
+                    .create_button(|b| {
+                        b.custom_id("clear_all")
+                            .label("Clear All Days")
+                            .style(serenity::model::application::component::ButtonStyle::Danger)
+                    })
+                    .create_button(|b| {
+                        b.custom_id("submit_votes")
+                            .label("Submit Votes")
+                            .style(serenity::model::application::component::ButtonStyle::Primary)
+                    });
+                    row
+                });
+                
+                c
+            });
+            
+            m
+        }).await;
+        
+        // If both methods fail, try a follow-up message as a last resort
+        if let Err(e2) = edit_result {
+            tracing::warn!("Failed to update message via both methods: {}", e2);
+            
+            // Try to send a follow-up message
+            let _ = component.create_followup_message(&ctx.ctx.http, |m| {
+                m.content("There was an error updating the message. Please return to the main message and try again.")
+                    .ephemeral(true)
+            }).await;
+            
+            return Err(eyre::eyre!("Failed to update message via all methods: Direct response: {}, Edit response: {}", e, e2));
+        }
+    }
+    
+    Ok(())
+}
+
 /// Find the optimal meeting slot based on votes
-fn find_optimal_meeting_slot(poll: &super::ActivePoll) -> Option<(usize, super::SlotInfo, Vec<String>)> {
+/// Takes into account only locked votes
+fn find_optimal_meeting_slot(poll: &super::ActivePoll, min_required_per_group: usize) -> Option<(usize, super::SlotInfo, Vec<String>)> {
     // A map to track votes for each slot
     let mut slot_votes: HashMap<String, Vec<String>> = HashMap::new();
     
-    // Get the set of users who submitted votes but selected nothing (marked as unavailable)
+    // Get the set of users who have locked in votes but selected nothing (marked as unavailable)
     let _unavailable_users: std::collections::HashSet<String> = poll.slot_responses.iter()
-        .filter(|(_, slots)| slots.is_empty())
+        .filter(|(user_id, slots)| 
+            poll.locked_votes.contains_key(*user_id) && slots.is_empty()
+        )
         .map(|(user_id, _)| user_id.clone())
         .collect();
     
-    // Collect all votes from users who selected at least one slot
+    // Collect all votes from users who have locked in votes and selected at least one slot
     for (user_id, selected_slots) in &poll.slot_responses {
+        // Only count votes from users who have locked in their votes
+        if !poll.locked_votes.contains_key(user_id) {
+            continue;
+        }
+        
         // Skip users who submitted with no selections (they're marked as unavailable)
         if selected_slots.is_empty() {
             continue;
@@ -2226,17 +3325,23 @@ fn find_optimal_meeting_slot(poll: &super::ActivePoll) -> Option<(usize, super::
             let mut group_counts: HashMap<uuid::Uuid, usize> = HashMap::new();
             
             for (group_id, members) in &poll.group_members {
-                // Count members who explicitly selected this slot
+                // Count members who have locked in votes and explicitly selected this slot
                 let group_vote_count = members.iter()
-                    .filter(|member_id| voters.contains(member_id))
+                    .filter(|member_id| 
+                        poll.locked_votes.contains_key(*member_id) && 
+                        voters.contains(member_id)
+                    )
                     .count();
                 
                 group_counts.insert(*group_id, group_vote_count);
             }
             
-            // Check if all groups meet minimum requirement
-            let all_groups_meet_min = group_counts.iter()
-                .all(|(_, &count)| count >= poll.min_per_group as usize);
+            // Check if all groups meet minimum requirement based on locked votes
+            let all_groups_meet_min = group_counts.iter().all(|(group_id, &count)| {
+                let members = &poll.group_members[group_id];
+                let required = std::cmp::min(min_required_per_group, members.len());
+                count >= required
+            });
             
             // Update best slot if this one is better
             if all_groups_meet_min && vote_count > max_votes {

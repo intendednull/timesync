@@ -149,6 +149,13 @@ pub fn match_command() -> CreateApplicationCommand {
                 .description("Maximum number of days to display (1-7, default: 7)")
                 .kind(CommandOptionType::Integer)
                 .required(false)
+        })
+        .create_option(|option| {
+            option
+                .name("time_span")
+                .description("Human-friendly time span (e.g., 'next 3 days', 'this weekend')")
+                .kind(CommandOptionType::String)
+                .required(false)
         });
     
     command
