@@ -1109,7 +1109,8 @@ fn generate_summary_message(poll: &super::ActivePoll, min_required_per_group: us
     // Add instructions
     message.push_str("\n**How to Vote:**\n");
     message.push_str("• Click **Edit Your Availability** to select the times you're available\n");
-    message.push_str("• When you're done, click **Lock In My Votes** to confirm your selection\n");
+    message.push_str("• Your votes are automatically saved as you select them\n");
+    message.push_str("• When you're done, click **Lock In My Votes** to finalize your selections\n");
     message.push_str("• If you don't select any times, you'll be marked as unavailable\n");
     message.push_str("• Members with saved schedules have their slots pre-selected\n");
     
@@ -1263,8 +1264,8 @@ fn format_time_slots(poll: &super::ActivePoll) -> String {
     // Add instructions
     message.push_str("Click on a time to toggle your availability. Green buttons indicate times you're available for. The number in brackets [0] shows how many people have selected that time.\n");
     message.push_str("Users with saved schedules will have their slots pre-selected. Users without schedules start with no selections.\n");
-    message.push_str("Use the navigation buttons to switch between days. 'Clear All Days' will mark you as unavailable for all days.\n");
-    message.push_str("When you're done, click 'Submit Votes' to lock in your selections. If you don't select any times, you'll be marked as unavailable.\n\n");
+    message.push_str("Use the navigation buttons to switch between days. 'Select All Days' will mark you as available for all time slots. 'Clear All Days' will mark you as unavailable for all days.\n");
+    message.push_str("Your votes are automatically saved as you select time slots. When you're finished, click 'Lock In My Votes' on the main message to finalize your selections.\n\n");
     
     message
 }
@@ -1282,7 +1283,7 @@ pub async fn handle_component_interaction(
         
         // Check if using a nav button on an ephemeral message by looking at button ID
         // and checking if the message is not in active polls
-        let is_nav_button = ["prev_day", "next_day", "select_all", "clear_all", "submit_votes", "return_to_main"]
+        let is_nav_button = ["prev_day", "next_day", "select_all", "clear_all"]
             .contains(&custom_id.as_str()) || custom_id.starts_with("slot_");
         
         // If it's a navigation button but doesn't match any active poll message, it might be ephemeral
@@ -1319,8 +1320,7 @@ pub async fn handle_component_interaction(
         "next_day" => handle_next_day(ctx.clone(), component, is_navigation_on_ephemeral).await,
         "select_all" => handle_select_all_slots(ctx.clone(), component, is_navigation_on_ephemeral).await,
         "clear_all" => handle_clear_all_slots(ctx.clone(), component, is_navigation_on_ephemeral).await,
-        "submit_votes" => handle_submit_votes(ctx.clone(), component).await,
-        "return_to_main" => handle_return_to_main(ctx.clone(), component).await,
+        // Removed "submit_votes" and "return_to_main" handlers
         _ if custom_id.starts_with("slot_") => {
             let slot_id = custom_id.strip_prefix("slot_").unwrap_or("");
             handle_slot_toggle(ctx.clone(), component, slot_id, is_navigation_on_ephemeral).await
@@ -1455,31 +1455,17 @@ async fn handle_open_voting_interface(
                             row
                         });
                         
-                        // Add select all / clear / submit buttons
+                        // Add select all / clear buttons (removed submit votes)
                         c.create_action_row(|row| {
                             row.create_button(|b| {
                                 b.custom_id("select_all")
-                                    .label("Select All")
+                                    .label("Select All Days")
                                     .style(serenity::model::application::component::ButtonStyle::Success)
                             })
                             .create_button(|b| {
                                 b.custom_id("clear_all")
                                     .label("Clear All Days")
                                     .style(serenity::model::application::component::ButtonStyle::Danger)
-                            })
-                            .create_button(|b| {
-                                b.custom_id("submit_votes")
-                                    .label("Submit Votes")
-                                    .style(serenity::model::application::component::ButtonStyle::Primary)
-                            })
-                        });
-                        
-                        // Add return button
-                        c.create_action_row(|row| {
-                            row.create_button(|b| {
-                                b.custom_id("return_to_main")
-                                    .label("Return to Main Message")
-                                    .style(serenity::model::application::component::ButtonStyle::Secondary)
                             })
                         })
                     })
@@ -1536,29 +1522,12 @@ fn format_personal_time_slots(poll: &super::ActivePoll, user_id: &str) -> String
     // Add instructions
     message.push_str("Click on a time to toggle your availability. Green buttons indicate times you're available for.\n");
     message.push_str("Use the navigation buttons to switch between days.\n");
-    message.push_str("When you're done selecting your availability, click 'Submit Votes' to update your selections.\n");
+    message.push_str("Use 'Select All Days' to mark yourself as available for all time slots across all days.\n");
     message.push_str("To finalize your votes, click 'Lock In My Votes' on the main message.\n");
     
     message
 }
 
-/// Handle return to main message button
-async fn handle_return_to_main(
-    ctx: HandlerContext,
-    component: &mut MessageComponentInteraction,
-) -> Result<()> {
-    // Delete the ephemeral message by updating it to be empty
-    component.create_interaction_response(&ctx.ctx.http, |r| {
-        r.kind(InteractionResponseType::UpdateMessage)
-            .interaction_response_data(|m| {
-                m.content("")
-                    .embed(|e| e.title("").description(""))
-                    .components(|c| c) // Clear components
-            })
-    }).await?;
-    
-    Ok(())
-}
 
 /// Handle locking in votes on the main message
 async fn handle_lock_votes(
@@ -2390,32 +2359,17 @@ async fn update_ephemeral_ui(
                 row
             });
             
-            // Add select all / clear / submit buttons
+            // Add select all / clear buttons
             c.create_action_row(|row| {
                 row.create_button(|b| {
                     b.custom_id("select_all")
-                        .label("Select All")
+                        .label("Select All Days")
                         .style(serenity::model::application::component::ButtonStyle::Success)
                 })
                 .create_button(|b| {
                     b.custom_id("clear_all")
                         .label("Clear All Days")
                         .style(serenity::model::application::component::ButtonStyle::Danger)
-                })
-                .create_button(|b| {
-                    b.custom_id("submit_votes")
-                        .label("Submit Votes")
-                        .style(serenity::model::application::component::ButtonStyle::Primary)
-                });
-                row
-            });
-            
-            // Add return button
-            c.create_action_row(|row| {
-                row.create_button(|b| {
-                    b.custom_id("return_to_main")
-                        .label("Return to Main Message")
-                        .style(serenity::model::application::component::ButtonStyle::Secondary)
                 });
                 row
             })
@@ -2690,24 +2644,16 @@ async fn handle_select_all_slots(
         return Ok(());
     }
     
-    // Get all slot IDs for the current day
-    let current_day_slots = match poll.day_slots.get(&poll.current_day) {
-        Some(slots) => slots,
-        None => {
-            drop(polls);
-            return Ok(());
-        }
-    };
-    
-    // Select all slots for this day
+    // Get all slot IDs from all days
+    let all_slot_ids: Vec<String> = poll.day_slots.values()
+        .flat_map(|slots| slots.iter().map(|slot| slot.id.clone()))
+        .collect();
+        
+    // Select all slots for all days
     let user_slots = poll.slot_responses.entry(voter_id.clone()).or_insert_with(Vec::new);
     
-    // Add all slots from the current day that aren't already selected
-    for slot in current_day_slots {
-        if !user_slots.contains(&slot.id) {
-            user_slots.push(slot.id.clone());
-        }
-    }
+    // Replace user's selections with all available slots
+    *user_slots = all_slot_ids;
     
     // Get a clone of the poll before releasing the lock
     let poll_clone = poll.clone();
@@ -2823,232 +2769,6 @@ async fn handle_clear_all_slots(
     Ok(())
 }
 
-/// Handle "Submit Votes" button click
-/// This submits the user's selected time slots but does not lock them in yet
-async fn handle_submit_votes(
-    ctx: HandlerContext,
-    component: &mut MessageComponentInteraction,
-) -> Result<()> {
-    // Get the voter ID
-    let voter_id = component.user.id.to_string();
-    
-    // For ephemeral messages, we need to find the main message ID
-    let mut polls = ctx.active_polls.write().await;
-    
-    // Find the main message ID by scanning for which poll has this user with selections
-    let mut main_message_id = None;
-    
-    for (message_id, poll) in polls.iter() {
-        if poll.slot_responses.contains_key(&voter_id) {
-            main_message_id = Some(*message_id);
-            break;
-        }
-    }
-    
-    let poll_message_id = main_message_id.ok_or_else(|| eyre::eyre!("Could not find associated poll"))?;
-    
-    // Now get the poll by message ID
-    let poll = polls.get_mut(&poll_message_id)
-        .ok_or_else(|| eyre::eyre!("No active poll found for this user"))?;
-    
-    // Check if the user is an eligible voter
-    let eligible_voters: Vec<String> = if poll.eligible_voters.is_empty() {
-        Vec::new()
-    } else {
-        poll.eligible_voters.split(',').map(|s| s.to_string()).collect()
-    };
-    
-    if !eligible_voters.contains(&voter_id) {
-        // Try to acknowledge the interaction
-        match component.create_interaction_response(&ctx.ctx.http, |r| {
-            r.kind(InteractionResponseType::ChannelMessageWithSource)
-                .interaction_response_data(|m| {
-                    m.content("You are not a member of any of the groups in this poll, so you cannot vote.")
-                        .ephemeral(true)
-                })
-        }).await {
-            Ok(_) => {},
-            Err(e) => {
-                // Log the error and try a followup message instead
-                tracing::warn!("Failed to send error response: {}", e);
-                let _ = component.create_followup_message(&ctx.ctx.http, |m| {
-                    m.content("You are not a member of any of the groups in this poll, so you cannot vote.")
-                        .ephemeral(true)
-                }).await;
-            }
-        }
-        
-        drop(polls);
-        return Ok(());
-    }
-    
-    // Try to acknowledge the interaction
-    match component.create_interaction_response(&ctx.ctx.http, |r| {
-        r.kind(InteractionResponseType::DeferredUpdateMessage)
-    }).await {
-        Ok(_) => {}, // Successfully acknowledged
-        Err(e) => {
-            // Log the error, but continue with the function
-            tracing::warn!("Failed to acknowledge interaction: {}", e);
-        }
-    }
-    
-    // Get a clone of the poll for updating the UI
-    let poll_clone = poll.clone();
-    drop(polls);
-    
-    // Update the ephemeral message with confirmation
-    let selected_count = poll_clone.slot_responses.get(&voter_id)
-        .map_or(0, |slots| slots.len());
-        
-    let time_slot_message = format_personal_time_slots(&poll_clone, &voter_id);
-    
-    // Try to update the ephemeral message with the updated vote selections
-    let edit_result = component.message.edit(&ctx.ctx.http, |m| {
-        m.embed(|e| {
-            e.title(format!("Your Availability - Day {} of {}", 
-                          poll_clone.current_day + 1, 
-                          poll_clone.day_slots.len()))
-                .description(&time_slot_message)
-                .color(Color::GOLD)
-                .footer(|f| f.text(format!(
-                    "You have selected {} time slots in total. Return to the main message to lock in your votes.",
-                    selected_count
-                )))
-        })
-        .components(|c| {
-            // Add time slot selection buttons with correct vote count and selection status
-            if let Some(slots) = poll_clone.day_slots.get(&poll_clone.current_day) {
-                for chunk in slots.chunks(5) {
-                    c.create_action_row(|row| {
-                        for slot in chunk {
-                            // Check if this slot is selected by the current user
-                            let user_selections = poll_clone.slot_responses.get(&voter_id).cloned().unwrap_or_default();
-                            let is_selected = user_selections.contains(&slot.id);
-                            
-                            // Count total votes for this slot
-                            let vote_count = poll_clone.slot_responses.values()
-                                .filter(|selected_slots| selected_slots.contains(&slot.id))
-                                .count();
-                                
-                            row.create_button(|b| {
-                                b.custom_id(format!("slot_{}", slot.id))
-                                    .label(format!("{} [{}]", &slot.formatted_time, vote_count))
-                                    .style(if is_selected {
-                                        serenity::model::application::component::ButtonStyle::Success // Green for selected
-                                    } else {
-                                        serenity::model::application::component::ButtonStyle::Secondary // Neutral/gray for not selected
-                                    })
-                            });
-                        }
-                        row
-                    });
-                }
-            }
-            
-            // Add navigation and utility buttons
-            c.create_action_row(|row| {
-                // Previous day button
-                row.create_button(|b| {
-                    b.custom_id("prev_day")
-                        .label("◀️ Previous Day")
-                        .style(serenity::model::application::component::ButtonStyle::Primary)
-                        .disabled(poll_clone.current_day == 0)
-                });
-                
-                // Next day button
-                row.create_button(|b| {
-                    b.custom_id("next_day")
-                        .label("Next Day ▶️")
-                        .style(serenity::model::application::component::ButtonStyle::Primary)
-                        .disabled(poll_clone.current_day >= poll_clone.day_slots.len() - 1)
-                });
-                row
-            });
-            
-            // Add select all / clear / submit buttons
-            c.create_action_row(|row| {
-                row.create_button(|b| {
-                    b.custom_id("select_all")
-                        .label("Select All")
-                        .style(serenity::model::application::component::ButtonStyle::Success)
-                })
-                .create_button(|b| {
-                    b.custom_id("clear_all")
-                        .label("Clear All Days")
-                        .style(serenity::model::application::component::ButtonStyle::Danger)
-                })
-                .create_button(|b| {
-                    b.custom_id("submit_votes")
-                        .label("Save Selections")
-                        .style(serenity::model::application::component::ButtonStyle::Primary)
-                })
-            });
-            
-            // Add return button
-            c.create_action_row(|row| {
-                row.create_button(|b| {
-                    b.custom_id("return_to_main")
-                        .label("Return to Main Message")
-                        .style(serenity::model::application::component::ButtonStyle::Secondary)
-                })
-            })
-        })
-    }).await;
-    
-    // If editing failed, try to send a followup instead
-    if let Err(e) = edit_result {
-        tracing::warn!("Failed to edit message: {}", e);
-        let _ = component.create_followup_message(&ctx.ctx.http, |m| {
-            m.content(format!("Your votes have been saved. You selected {} time slots. Return to the main message to lock in your votes.", selected_count))
-                .ephemeral(true)
-        }).await;
-    }
-    
-    // Try to update the main message with updated vote counts
-    let main_message = serenity::model::id::MessageId(poll_message_id.0);
-    if let Ok(mut message) = ctx.ctx.http.get_message(component.channel_id.0, main_message.0).await {
-        let summary_message = generate_summary_message(&poll_clone, 6); // Default to 6 for min required
-        
-        match message.edit(&ctx.ctx.http, |m| {
-            m.embed(|e| {
-                e.title("Meeting Time Proposal")
-                    .description(&summary_message)
-                    .color(Color::GOLD)
-                    .footer(|f| f.text(format!(
-                        "Min members per group: {} • Slot duration: {} min • Timezone: {}",
-                        6, // Default to 6 for min required
-                        poll_clone.slot_duration,
-                        poll_clone.timezone
-                    )))
-            })
-            .components(|c| {
-                c.create_action_row(|row| {
-                    // Edit votes button
-                    row.create_button(|b| {
-                        b.custom_id("open_voting")
-                            .label("Edit Your Availability")
-                            .style(serenity::model::application::component::ButtonStyle::Primary)
-                            .emoji('✏')
-                    })
-                    .create_button(|b| {
-                        b.custom_id("lock_votes")
-                            .label("Lock In My Votes")
-                            .style(serenity::model::application::component::ButtonStyle::Success)
-                            .emoji('🔒')
-                    })
-                })
-            })
-        }).await {
-            Ok(_) => {},
-            Err(e) => {
-                tracing::warn!("Failed to update main message: {}", e);
-            }
-        }
-    }
-    
-    Ok(())
-}
 
 /// Update the time slot message UI 
 async fn update_time_slot_message(
@@ -3135,23 +2855,18 @@ async fn update_time_slot_message(
                     })
                 });
                 
-                // Add select all / clear / submit buttons
+                // Add select all / clear buttons
                 m.components(|c| {
                     c.create_action_row(|row| {
                         row.create_button(|b| {
                             b.custom_id("select_all")
-                                .label("Select All")
+                                .label("Select All Days")
                                 .style(serenity::model::application::component::ButtonStyle::Success)
                         })
                         .create_button(|b| {
                             b.custom_id("clear_all")
                                 .label("Clear All Days")
                                 .style(serenity::model::application::component::ButtonStyle::Danger)
-                        })
-                        .create_button(|b| {
-                            b.custom_id("submit_votes")
-                                .label("Submit Votes")
-                                .style(serenity::model::application::component::ButtonStyle::Primary)
                         });
                         row
                     })
@@ -3235,22 +2950,17 @@ async fn update_time_slot_message(
                     row
                 });
                 
-                // Add select all / clear / submit buttons
+                // Add select all / clear buttons
                 c.create_action_row(|row| {
                     row.create_button(|b| {
                         b.custom_id("select_all")
-                            .label("Select All")
+                            .label("Select All Days")
                             .style(serenity::model::application::component::ButtonStyle::Success)
                     })
                     .create_button(|b| {
                         b.custom_id("clear_all")
                             .label("Clear All Days")
                             .style(serenity::model::application::component::ButtonStyle::Danger)
-                    })
-                    .create_button(|b| {
-                        b.custom_id("submit_votes")
-                            .label("Submit Votes")
-                            .style(serenity::model::application::component::ButtonStyle::Primary)
                     });
                     row
                 });
